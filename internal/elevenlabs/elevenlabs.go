@@ -51,9 +51,10 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 // GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
 	config := map[string]interface{}{
-		"type":                "conversation_initiation_client_data",
-		"input_audio_format":  "mulaw_8000",
-		"output_audio_format": "mulaw_8000",
+		"type":               "conversation_initiation_client_data",
+		// IMPORTANT: Twilio <-> ElevenLabs must both use ulaw_8000 (µ-law, 8kHz)
+		"input_audio_format":  "ulaw_8000",
+		"output_audio_format": "ulaw_8000",
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
 		},
