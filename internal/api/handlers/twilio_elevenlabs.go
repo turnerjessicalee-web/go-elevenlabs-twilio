@@ -307,4 +307,258 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			case "stop":
 				// Twilio is ending the stream
 				if elevenLabsWs != nil {
-					_ =
+					_ = elevenLabsWs.WriteJSON(map[string]string{
+						"type": "end_of_conversation",
+					})
+					_ = elevenLabsWs.Close()
+				}
+
+				disconnectCall()
+				return
+			}
+		}
+	})
+}
+
+// -------------------- OUTBOUND CALL HANDLERS --------------------
+
+// HandleOutboundCall initiates calls from our system to specified phone numbers
+// Accepts number and prompt in JSON request and returns call status
+func HandleOutboundCall(cfg *config.Config) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Number string `json:"number"`
+			Prompt string `json:"prompt"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if strings.TrimSpace(req.Number) == "" {
+			http.Error(w, "Phone number is required", http.StatusBadRequest)
+			return
+		}
+
+		// Build URL that Twilio will request to get TwiML for the outbound call
+		callURL := fmt.Sprintf(
+			"https://%s/outbound-call-twiml?prompt=%s&number=%s",
+			r.Host,
+			url.QueryEscape(req.Prompt),
+			url.QueryEscape(req.Number),
+		)
+
+		params := map[string]string{
+			"To":   req.Number,
+			"From": cfg.TwilioPhoneNumber,
+			"Url":  callURL,
+		}
+
+		call, err := createTwilioCall(params, cfg.TwilioAccountSID, cfg.TwilioAuthToken)
+		if err != nil {
+			log.Printf("[Twilio] Error creating call: %v", err)
+			http.Error(w, "Failed to initiate call", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Call initiated",
+			"callSid": call["sid"],
+		})
+	})
+}
+
+// HandleOutboundCallTwiml generates XML instructions for Twilio when setting up outbound calls
+// Provides parameters needed for the media stream connection
+func HandleOutboundCallTwiml() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prompt := r.URL.Query().Get("prompt")
+		number := r.URL.Query().Get("number")
+
+		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="wss://%s/media-stream">
+            <Parameter name="caller_phone" value="%s" />
+            <Parameter name="prompt" value="%s" />
+            <Parameter name="direction" value="outbound" />
+        </Stream>
+    </Connect>
+</Response>`, r.Host, number, url.QueryEscape(prompt))
+
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(twiml))
+	})
+}
+
+// -------------------- ELEVENLABS MESSAGE LOOP --------------------
+
+// handleElevenLabsMessages processes responses from ElevenLabs AI and forwards audio to Twilio
+func handleElevenLabsMessages(
+	elevenLabsWs, twilioWs *websocket.Conn,
+	conversation *ConversationData,
+	disconnectFunc func(),
+) {
+	for {
+		_, message, err := elevenLabsWs.ReadMessage()
+		if err != nil {
+			log.Printf("[ElevenLabs] WebSocket error: %v", err)
+
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Println("[ElevenLabs] Connection closed normally")
+			} else {
+				log.Printf("[ElevenLabs] Abnormal connection closure: %v", err)
+			}
+
+			disconnectFunc()
+			break
+		}
+
+		var data map[string]interface{}
+		if err := json.Unmarshal(message, &data); err != nil {
+			log.Printf("[ElevenLabs] Error parsing message: %v", err)
+			continue
+		}
+
+		messageType, _ := data["type"].(string)
+		log.Printf("[ElevenLabs] Received message type: %s", messageType)
+
+		switch messageType {
+		case "conversation_initiation_metadata":
+			// Extract conversation ID
+			if metadataEvent, ok := data["conversation_initiation_metadata_event"].(map[string]interface{}); ok {
+				if conversationID, ok := metadataEvent["conversation_id"].(string); ok {
+					conversation.ConversationID = conversationID
+					log.Printf("[ElevenLabs] Stored conversation ID: %s", conversationID)
+					conversations.Store(conversation.StreamSid, conversation)
+				}
+			}
+
+		case "audio":
+			// Extract audio data and send to Twilio
+			var audioBase64 string
+
+			if audioEvent, ok := data["audio_event"].(map[string]interface{}); ok {
+				audioBase64, _ = audioEvent["audio_base_64"].(string)
+			} else if audio, ok := data["audio"].(map[string]interface{}); ok {
+				audioBase64, _ = audio["chunk"].(string)
+			}
+
+			if audioBase64 != "" {
+				audioData := map[string]interface{}{
+					"event":     "media",
+					"streamSid": conversation.StreamSid,
+					"media": map[string]string{
+						"payload": audioBase64,
+					},
+				}
+
+				if err := twilioWs.WriteJSON(audioData); err != nil {
+					log.Printf("[Twilio] Error sending audio: %v", err)
+				}
+			}
+
+		case "interruption":
+			// Clear any buffered audio on Twilio side
+			clearMsg := map[string]interface{}{
+				"event":     "clear",
+				"streamSid": conversation.StreamSid,
+			}
+			if err := twilioWs.WriteJSON(clearMsg); err != nil {
+				log.Printf("[Twilio] Error sending clear: %v", err)
+			}
+
+		case "ping":
+			// Respond with pong
+			if pingEvent, ok := data["ping_event"].(map[string]interface{}); ok {
+				if eventID, ok := pingEvent["event_id"].(string); ok {
+					pongResponse := map[string]interface{}{
+						"type":     "pong",
+						"event_id": eventID,
+					}
+					if err := elevenLabsWs.WriteJSON(pongResponse); err != nil {
+						log.Printf("[ElevenLabs] Error sending pong: %v", err)
+					}
+				}
+			}
+
+		case "end_of_conversation":
+			log.Println("[ElevenLabs] End of conversation received")
+			disconnectFunc()
+			return
+		}
+	}
+}
+
+// -------------------- TWILIO REST HELPERS --------------------
+
+// createTwilioCall sends API request to Twilio to initiate an outbound call
+// Returns call details including SID for tracking the call status
+func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
+	client := &http.Client{}
+
+	form := url.Values{}
+	for key, value := range params {
+		form.Add(key, value)
+	}
+
+	req, err := http.NewRequest(
+		"POST",
+		fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json", accountSid),
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	req.SetBasicAuth(accountSid, authToken)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// -------------------- MOCK HELPERS --------------------
+
+// checkUserExists verifies caller authorization based on phone number
+// Returns user data if authorized or nil if unauthorized
+func checkUserExists(phone string) (map[string]interface{}, error) {
+	// Mocked number authentication for testing purposes
+	log.Printf("[Mock] Checking if user exists with phone: %s", phone)
+
+	// Return mock user data
+	return map[string]interface{}{
+		"first_name": "John",
+		"last_name":  "Doe",
+		"phone":      phone,
+	}, nil
+}
+
+// sendConversationWebhook notifies external systems about call events
+// Sends conversation metadata to specified endpoint with authentication
+func sendConversationWebhook(payload map[string]interface{}, endpoint string, authToken string) error {
+	// Mocked webhook call
+	log.Printf("[Mock Webhook] Sending payload to %s: %+v", endpoint, payload)
+	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
+
+	// Simulate successful webhook call
+	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
+	return nil
+}
