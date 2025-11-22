@@ -3,6 +3,7 @@ package handlers
 import (
 	"caller/internal/config"
 	"caller/internal/elevenlabs"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,7 +28,7 @@ type ConversationData struct {
 	Direction      string // "inbound" or "outbound"
 }
 
-// HandleIncomingCall processes webhook requests from Twilio when someone calls our number
+// handleIncomingCall processes webhook requests from twilio when someone calls our number
 func HandleIncomingCall() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -57,7 +58,6 @@ func HandleIncomingCall() http.Handler {
 <Response>
 	<Connect>
 		<Stream url="wss://%s/media-stream">
-			<Audio sample-rate="16000" encoding="linear16"/>
 			<Parameter name="caller_phone" value="%s" />
 			<Parameter name="user_data" value="%s" />
 			<Parameter name="direction" value="inbound" />
@@ -71,7 +71,7 @@ func HandleIncomingCall() http.Handler {
 }
 
 // HandleMediaStream manages bidirectional audio between Twilio and ElevenLabs
-// upgrades http to websocket and routes audio between caller and AI
+// Upgrades HTTP to WebSocket and routes audio between caller and AI
 func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -95,8 +95,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			disconnectMutex sync.Mutex
 		)
 
-		// disconnectCall safely terminates the call, sending required commands to twilio
-		// and cleaning up resources to prevent memory leaks
 		disconnectCall := func() {
 			disconnectMutex.Lock()
 			defer disconnectMutex.Unlock()
@@ -104,7 +102,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			if isDisconnecting {
 				return
 			}
-
 			isDisconnecting = true
 			log.Println("[Twilio] Initiating call disconnect")
 
@@ -125,7 +122,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					log.Printf("[Webhook] Error sending webhook: %v", err)
 				}
 
-				// Remove from conversations map
 				conversations.Delete(streamSid)
 			}
 
@@ -142,7 +138,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				}
 			}
 
-			// Close WebSocket after a delay
 			time.AfterFunc(1*time.Second, func() {
 				_ = conn.Close()
 			})
@@ -150,14 +145,12 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 
 		// main websocket message loop
 		for {
-			// read message from twilio
 			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				log.Printf("[Twilio] WebSocket error: %v", err)
 				break
 			}
 
-			// skip processing for non-text messages
 			if messageType != websocket.TextMessage {
 				continue
 			}
@@ -175,19 +168,16 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 
 			log.Printf("[Twilio] Received event: %s", event)
 
-			// skip non-stop events if disconnecting
 			disconnectMutex.Lock()
 			localIsDisconnecting := isDisconnecting
 			disconnectMutex.Unlock()
 
-			// ignore events if disconnecting
 			if localIsDisconnecting && event != "stop" {
 				continue
 			}
 
 			switch event {
 			case "start":
-				// extract stream data from start event
 				startData, ok := data["start"].(map[string]interface{})
 				if !ok {
 					log.Println("[Twilio] Invalid start data")
@@ -199,24 +189,20 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					callSid, _ = callSidVal.(string)
 				}
 
-				// extract custom parameters
 				customParams, ok := startData["customParameters"].(map[string]interface{})
 				if !ok {
 					log.Println("[Twilio] No custom parameters")
 					continue
 				}
 
-				// get caller phone
 				if phone, ok := customParams["caller_phone"].(string); ok {
 					callerPhone = phone
 				}
 
-				// get call direction
 				if dir, ok := customParams["direction"].(string); ok {
 					direction = dir
 				}
 
-				// parse user data
 				if userDataStr, ok := customParams["user_data"].(string); ok {
 					decodedStr, err := url.QueryUnescape(userDataStr)
 					if err != nil {
@@ -228,7 +214,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					}
 				}
 
-				// create conversation data
 				conversation = &ConversationData{
 					StreamSid:   streamSid,
 					CallSid:     callSid,
@@ -241,7 +226,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 
 				log.Printf("[Twilio] Stream started - SID: %s, Phone: %s", streamSid, callerPhone)
 
-				// get a signed URL for ElevenLabs
 				signedURL, err := elevenlabs.GetSignedElevenLabsURL(cfg.ElevenLabsAgentID, cfg.ElevenLabsAPIKey)
 				if err != nil {
 					log.Printf("[ElevenLabs] Error getting signed URL: %v", err)
@@ -249,7 +233,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					continue
 				}
 
-				// connect to ElevenLabs
 				elevenLabsWs, _, err = websocket.DefaultDialer.Dial(signedURL, nil)
 				if err != nil {
 					log.Printf("[ElevenLabs] Error connecting: %v", err)
@@ -257,22 +240,18 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					continue
 				}
 
-				// generate configuration based on direction
 				isInbound := direction == "inbound"
-				configMsg := elevenlabs.GenerateElevenLabsConfig(userData, callerPhone, isInbound)
+				elConfig := elevenlabs.GenerateElevenLabsConfig(userData, callerPhone, isInbound)
 
-				// send configuration
-				if err := elevenLabsWs.WriteJSON(configMsg); err != nil {
+				if err := elevenLabsWs.WriteJSON(elConfig); err != nil {
 					log.Printf("[ElevenLabs] Error sending config: %v", err)
 					disconnectCall()
 					continue
 				}
 
-				// handle ElevenLabs messages
 				go handleElevenLabsMessages(elevenLabsWs, conn, conversation, disconnectCall)
 
 			case "media":
-				// forward audio to ElevenLabs
 				if elevenLabsWs != nil && !localIsDisconnecting {
 					mediaData, ok := data["media"].(map[string]interface{})
 					if !ok {
@@ -286,9 +265,20 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 						continue
 					}
 
-					// send audio to ElevenLabs
+					// Twilio -> μ-law 8k base64
+					muBytes, err := base64.StdEncoding.DecodeString(payload)
+					if err != nil {
+						log.Printf("[Audio] Failed to decode Twilio μ-law base64: %v", err)
+						continue
+					}
+
+					// Convert μ-law 8k -> PCM 16k (16-bit LE)
+					pcm16k := muLaw8kToPCM16k(muBytes)
+
+					pcmB64 := base64.StdEncoding.EncodeToString(pcm16k)
+
 					audioMessage := map[string]string{
-						"user_audio_chunk": payload,
+						"user_audio_chunk": pcmB64,
 					}
 
 					if err := elevenLabsWs.WriteJSON(audioMessage); err != nil {
@@ -297,7 +287,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				}
 
 			case "stop":
-				// end the conversation and close connections
 				if elevenLabsWs != nil {
 					_ = elevenLabsWs.WriteJSON(map[string]string{
 						"type": "end_conversation",
@@ -330,7 +319,6 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
-		// create twilio call
 		callURL := fmt.Sprintf("https://%s/outbound-call-twiml?prompt=%s&number=%s",
 			r.Host, url.QueryEscape(req.Prompt), url.QueryEscape(req.Number))
 
@@ -366,7 +354,6 @@ func HandleOutboundCallTwiml() http.Handler {
 <Response>
     <Connect>
         <Stream url="wss://%s/media-stream">
-            <Audio sample-rate="16000" encoding="linear16"/>
             <Parameter name="caller_phone" value="%s" />
             <Parameter name="prompt" value="%s" />
             <Parameter name="direction" value="outbound" />
@@ -392,7 +379,6 @@ func handleElevenLabsMessages(
 		if err != nil {
 			log.Printf("[ElevenLabs] WebSocket error: %v", err)
 
-			// Handle connection closure
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Println("[ElevenLabs] Connection closed normally")
 			} else {
@@ -414,18 +400,16 @@ func handleElevenLabsMessages(
 
 		switch messageType {
 		case "conversation_initiation_metadata":
-			// Extract conversation ID
 			if metadataEvent, ok := data["conversation_initiation_metadata_event"].(map[string]interface{}); ok {
 				if conversationID, ok := metadataEvent["conversation_id"].(string); ok {
 					conversation.ConversationID = conversationID
 					log.Printf("[ElevenLabs] Stored conversation ID: %s", conversationID)
-
 					conversations.Store(conversation.StreamSid, conversation)
 				}
+				log.Printf("[ElevenLabs] Metadata: %+v", metadataEvent)
 			}
 
 		case "audio":
-			// Extract audio data and send to Twilio
 			var audioBase64 string
 			if audioEvent, ok := data["audio_event"].(map[string]interface{}); ok {
 				audioBase64, _ = audioEvent["audio_base_64"].(string)
@@ -434,11 +418,20 @@ func handleElevenLabsMessages(
 			}
 
 			if audioBase64 != "" {
+				pcmBytes, err := base64.StdEncoding.DecodeString(audioBase64)
+				if err != nil {
+					log.Printf("[Audio] Failed to decode ElevenLabs PCM base64: %v", err)
+					continue
+				}
+
+				muBytes := pcm16kToMuLaw8k(pcmBytes)
+				muB64 := base64.StdEncoding.EncodeToString(muBytes)
+
 				audioData := map[string]interface{}{
 					"event":     "media",
 					"streamSid": conversation.StreamSid,
 					"media": map[string]string{
-						"payload": audioBase64,
+						"payload": muB64,
 					},
 				}
 
@@ -448,7 +441,6 @@ func handleElevenLabsMessages(
 			}
 
 		case "interruption":
-			// Clear the current audio
 			clearMsg := map[string]interface{}{
 				"event":     "clear",
 				"streamSid": conversation.StreamSid,
@@ -459,7 +451,6 @@ func handleElevenLabsMessages(
 			}
 
 		case "ping":
-			// Respond to ping with pong
 			if pingEvent, ok := data["ping_event"].(map[string]interface{}); ok {
 				if eventID, ok := pingEvent["event_id"].(string); ok {
 					pongResponse := map[string]interface{}{
@@ -535,4 +526,103 @@ func sendConversationWebhook(payload map[string]interface{}, endpoint string, au
 	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
 	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
 	return nil
+}
+
+//////////////////////
+// AUDIO CONVERSION //
+//////////////////////
+
+const (
+	muLawBias = 0x84
+	muLawMax  = 0x1FFF
+)
+
+// μ-law 8k → PCM 16k (16-bit LE) by decoding and duplicating each sample
+func muLaw8kToPCM16k(mu []byte) []byte {
+	if len(mu) == 0 {
+		return nil
+	}
+
+	out := make([]byte, len(mu)*4) // 1 μ-law sample -> 2 PCM samples -> 4 bytes
+	outIdx := 0
+
+	for _, b := range mu {
+		s := muLawDecode(b)
+
+		// sample 1
+		out[outIdx] = byte(s & 0xff)
+		out[outIdx+1] = byte((s >> 8) & 0xff)
+		// sample 2 (duplicate for 16k)
+		out[outIdx+2] = out[outIdx]
+		out[outIdx+3] = out[outIdx+1]
+
+		outIdx += 4
+	}
+
+	return out
+}
+
+// PCM 16k (16-bit LE) → μ-law 8k by dropping every second sample and encoding
+func pcm16kToMuLaw8k(pcm []byte) []byte {
+	if len(pcm) < 4 {
+		return nil
+	}
+
+	numOut := len(pcm) / 4 // we take one 16-bit sample for every 2 samples (4 bytes)
+	out := make([]byte, numOut)
+
+	outIdx := 0
+	for i := 0; i < numOut; i++ {
+		src := i * 4
+		if src+1 >= len(pcm) {
+			break
+		}
+		s := int16(pcm[src]) | int16(pcm[src+1])<<8
+		out[outIdx] = muLawEncode(s)
+		outIdx++
+	}
+
+	return out[:outIdx]
+}
+
+func muLawDecode(b byte) int16 {
+	// standard μ-law decode
+	b = ^b
+	sign := b & 0x80
+	exponent := (b & 0x70) >> 4
+	mantissa := b & 0x0F
+
+	sample := ((int16(mantissa) << 4) + 0x08) << exponent
+	sample -= muLawBias
+
+	if sign != 0 {
+		sample = -sample
+	}
+
+	return sample
+}
+
+func muLawEncode(sample int16) byte {
+	sign := byte(0)
+	if sample < 0 {
+		sign = 0x80
+		sample = -sample
+		if sample < 0 {
+			sample = 0
+		}
+	}
+
+	if sample > muLawMax {
+		sample = muLawMax
+	}
+	sample += muLawBias
+
+	exponent := byte(7)
+	for expMask := 0x4000; (int(sample)&expMask) == 0 && exponent > 0; exponent-- {
+		expMask >>= 1
+	}
+
+	mantissa := (sample >> (exponent + 3)) & 0x0F
+	mu := ^(sign | (exponent << 4) | byte(mantissa))
+	return mu
 }
