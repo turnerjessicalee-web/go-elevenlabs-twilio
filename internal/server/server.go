@@ -29,7 +29,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 	router := api.NewRouter(s.cfg, s.upgrader)
 	s.srv = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%s", cfg.Port),
+		Addr:    fmt.Sprintf("0.0.0.0:%s", cfg.Port),
 		Handler: router,
 	}
 
