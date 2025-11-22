@@ -281,9 +281,11 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 						continue
 					}
 
-					// IMPORTANT: only forward INBOUND audio (caller → Twilio)
-					if track, ok := mediaData["track"].(string); ok && track != "" && track != "inbound" {
-						// Skip outbound / other tracks
+					// Twilio typically uses values like "inbound_track" / "outbound_track".
+					// We ONLY want caller audio -> anything "inbound".
+					track, _ := mediaData["track"].(string)
+					if track != "" && !strings.HasPrefix(track, "inbound") {
+						// Skip outbound / non-caller audio
 						continue
 					}
 
