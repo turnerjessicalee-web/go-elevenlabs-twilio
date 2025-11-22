@@ -252,6 +252,8 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				go handleElevenLabsMessages(elevenLabsWs, conn, conversation, disconnectCall)
 
 			case "media":
+				// forward raw Twilio μ-law 8k base64 directly to ElevenLabs
+				// (we configured input_audio_format = "mulaw_8000")
 				if elevenLabsWs != nil && !localIsDisconnecting {
 					mediaData, ok := data["media"].(map[string]interface{})
 					if !ok {
@@ -265,20 +267,8 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 						continue
 					}
 
-					// Twilio -> μ-law 8k base64
-					muBytes, err := base64.StdEncoding.DecodeString(payload)
-					if err != nil {
-						log.Printf("[Audio] Failed to decode Twilio μ-law base64: %v", err)
-						continue
-					}
-
-					// Convert μ-law 8k -> PCM 16k (16-bit LE)
-					pcm16k := muLaw8kToPCM16k(muBytes)
-
-					pcmB64 := base64.StdEncoding.EncodeToString(pcm16k)
-
 					audioMessage := map[string]string{
-						"user_audio_chunk": pcmB64,
+						"user_audio_chunk": payload,
 					}
 
 					if err := elevenLabsWs.WriteJSON(audioMessage); err != nil {
@@ -489,140 +479,4 @@ func createTwilioCall(params map[string]string, accountSid, authToken string) (m
 	}
 
 	req.SetBasicAuth(accountSid, authToken)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-// checkUserExists verifies caller authorization based on phone number
-func checkUserExists(phone string) (map[string]interface{}, error) {
-	log.Printf("[Mock] Checking if user exists with phone: %s", phone)
-
-	return map[string]interface{}{
-		"first_name": "John",
-		"last_name":  "Doe",
-		"phone":      phone,
-	}, nil
-}
-
-// sendConversationWebhook notifies external systems about call events
-func sendConversationWebhook(payload map[string]interface{}, endpoint string, authToken string) error {
-	log.Printf("[Mock Webhook] Sending payload to %s: %+v", endpoint, payload)
-	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
-	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
-	return nil
-}
-
-//////////////////////
-// AUDIO CONVERSION //
-//////////////////////
-
-const (
-	muLawBias = 0x84
-	muLawMax  = 0x1FFF
-)
-
-// μ-law 8k → PCM 16k (16-bit LE) by decoding and duplicating each sample
-func muLaw8kToPCM16k(mu []byte) []byte {
-	if len(mu) == 0 {
-		return nil
-	}
-
-	out := make([]byte, len(mu)*4) // 1 μ-law sample -> 2 PCM samples -> 4 bytes
-	outIdx := 0
-
-	for _, b := range mu {
-		s := muLawDecode(b)
-
-		// sample 1
-		out[outIdx] = byte(s & 0xff)
-		out[outIdx+1] = byte((s >> 8) & 0xff)
-		// sample 2 (duplicate for 16k)
-		out[outIdx+2] = out[outIdx]
-		out[outIdx+3] = out[outIdx+1]
-
-		outIdx += 4
-	}
-
-	return out
-}
-
-// PCM 16k (16-bit LE) → μ-law 8k by dropping every second sample and encoding
-func pcm16kToMuLaw8k(pcm []byte) []byte {
-	if len(pcm) < 4 {
-		return nil
-	}
-
-	numOut := len(pcm) / 4 // we take one 16-bit sample for every 2 samples (4 bytes)
-	out := make([]byte, numOut)
-
-	outIdx := 0
-	for i := 0; i < numOut; i++ {
-		src := i * 4
-		if src+1 >= len(pcm) {
-			break
-		}
-		s := int16(pcm[src]) | int16(pcm[src+1])<<8
-		out[outIdx] = muLawEncode(s)
-		outIdx++
-	}
-
-	return out[:outIdx]
-}
-
-func muLawDecode(b byte) int16 {
-	// standard μ-law decode
-	b = ^b
-	sign := b & 0x80
-	exponent := (b & 0x70) >> 4
-	mantissa := b & 0x0F
-
-	sample := ((int16(mantissa) << 4) + 0x08) << exponent
-	sample -= muLawBias
-
-	if sign != 0 {
-		sample = -sample
-	}
-
-	return sample
-}
-
-func muLawEncode(sample int16) byte {
-	sign := byte(0)
-	if sample < 0 {
-		sign = 0x80
-		sample = -sample
-		if sample < 0 {
-			sample = 0
-		}
-	}
-
-	if sample > muLawMax {
-		sample = muLawMax
-	}
-	sample += muLawBias
-
-	exponent := byte(7)
-	for expMask := 0x4000; (int(sample)&expMask) == 0 && exponent > 0; exponent-- {
-		expMask >>= 1
-	}
-
-	mantissa := (sample >> (exponent + 3)) & 0x0F
-	mu := ^(sign | (exponent << 4) | byte(mantissa))
-	return mu
-}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded"
