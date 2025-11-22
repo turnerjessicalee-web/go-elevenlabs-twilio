@@ -3,6 +3,8 @@ package elevenlabs
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+    "log"
 	"net/http"
 )
 
@@ -25,7 +27,15 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to get signed URL: %s", resp.Status)
+    body, _ := io.ReadAll(resp.Body)
+
+    log.Printf(
+        "[ElevenLabs] failed to get signed URL: status=%s body=%s",
+        resp.Status,
+        string(body),
+    )
+
+    return "", fmt.Errorf("failed to get signed URL: %s", resp.Status)
 	}
 
 	var result struct {
