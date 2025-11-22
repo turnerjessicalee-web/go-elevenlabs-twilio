@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-    "log"
+	"log"
 	"net/http"
 )
 
@@ -27,103 +27,19 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-    body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 
-    log.Printf(
-        "[ElevenLabs] failed to get signed URL: status=%s body=%s",
-        resp.Status,
-        string(body),
-    )
+		log.Printf(
+			"[ElevenLabs] failed to get signed URL: status=%s body=%s",
+			resp.Status,
+			string(body),
+		)
 
-    return "", fmt.Errorf("failed to get signed URL: %s", resp.Status)
+		return "", fmt.Errorf("failed to get signed URL: %s", resp.Status)
 	}
 
 	var result struct {
 		SignedURL string `json:"signed_url"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("error parsing signed URL response: %w", err)
-	}
-
-	return result.SignedURL, nil
-}
-
-// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
-func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
-	config := map[string]interface{}{
-		"type": "conversation_initiation_client_data",
-		"conversation_config_override": map[string]interface{}{
-			"agent": map[string]interface{}{},
-		},
-	}
-
-	var firstName, lastName string
-
-	if userData != nil {
-		if debtor, ok := userData["debtor"].(map[string]interface{}); ok {
-			if fn, ok := debtor["first_name"].(string); ok {
-				firstName = fn
-			}
-			if ln, ok := debtor["last_name"].(string); ok {
-				lastName = ln
-			}
-		}
-	}
-
-	// Set prompt and first message based on call direction
-	if isInbound {
-		// For inbound calls
-		inboundPrompt, _ := generateInboundCallPrompt(
-			fmt.Sprintf("%s %s", firstName, lastName),
-		)
-
-		agentConfig := config["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
-		agentConfig["prompt"] = map[string]interface{}{
-			"prompt": inboundPrompt,
-		}
-	} else {
-		// For outbound calls
-		outboundPrompt, _ := generateOutboundCallPrompt(
-			fmt.Sprintf("%s %s", firstName, lastName),
-		)
-
-		agentConfig := config["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
-		agentConfig["prompt"] = map[string]interface{}{
-			"prompt": outboundPrompt,
-		}
-	}
-
-	// add dynamic variables if user data is available
-	if userData != nil {
-		config["client_data"] = map[string]interface{}{
-			"dynamic_variables": map[string]string{
-				"caller_phone": callerPhone,
-				"caller_name":  fmt.Sprintf("%s %s", firstName, lastName),
-			},
-		}
-	}
-
-	return config
-}
-
-func generateInboundCallPrompt(
-	name string,
-) (string, error) {
-	prompt := `
-You are an AI Agent that is supportive and helpful.
-You main task it to motivate the interlocutor who's name is %s to enjoy their life.
-`
-
-	return fmt.Sprintf(prompt, name), nil
-}
-
-func generateOutboundCallPrompt(
-	name string,
-) (string, error) {
-	prompt := `
-You are an AI Agent that is supportive and helpful.
-You main task it to motivate the interlocutor who's name is %s to enjoy their life.
-`
-
-	return fmt.Sprintf(prompt, name), nil
-}
+		return "", fmt.Errorf("error parsing signed URL response: %w", er
