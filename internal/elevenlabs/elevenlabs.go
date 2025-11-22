@@ -81,7 +81,6 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		agentConfig["prompt"] = map[string]interface{}{
 			"prompt": inboundPrompt,
 		}
-		agentConfig["first_message"] = fmt.Sprintf("Hi %s! I'm a supportive AI Agent. Do you have a moment to talk?", firstName)
 	} else {
 		// For outbound calls
 		outboundPrompt, _ := generateOutboundCallPrompt(
@@ -92,7 +91,6 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		agentConfig["prompt"] = map[string]interface{}{
 			"prompt": outboundPrompt,
 		}
-		agentConfig["first_message"] = fmt.Sprintf("Hi %s! A supportive AI Agent is here to help you. What do you want to talk about?", firstName)
 	}
 
 	// add dynamic variables if user data is available
