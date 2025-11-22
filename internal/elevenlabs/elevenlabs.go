@@ -48,11 +48,13 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 	return result.SignedURL, nil
 }
 
-// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation.
-// We DELIBERATELY do NOT override audio formats here – we keep ElevenLabs defaults (PCM).
+// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
+// NOTE: we keep ElevenLabs on its default PCM 16k formats and handle μ-law conversion in Go.
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
 	config := map[string]interface{}{
-		"type": "conversation_initiation_client_data",
+		"type":               "conversation_initiation_client_data",
+		"input_audio_format": "pcm_16000",
+		"output_audio_format": "pcm_16000",
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
 		},
@@ -88,7 +90,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		}
 	}
 
-	// Add dynamic variables if user data is available
+	// add dynamic variables if user data is available
 	if userData != nil {
 		config["client_data"] = map[string]interface{}{
 			"dynamic_variables": map[string]string{
