@@ -48,13 +48,11 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 	return result.SignedURL, nil
 }
 
-// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
+// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation.
+// We DELIBERATELY do NOT override audio formats here – we keep ElevenLabs defaults (PCM).
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
 	config := map[string]interface{}{
-		"type":               "conversation_initiation_client_data",
-		// IMPORTANT: Twilio <-> ElevenLabs must both use ulaw_8000 (µ-law, 8kHz)
-		"input_audio_format":  "ulaw_8000",
-		"output_audio_format": "ulaw_8000",
+		"type": "conversation_initiation_client_data",
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
 		},
@@ -90,7 +88,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		}
 	}
 
-	// add dynamic variables if user data is available
+	// Add dynamic variables if user data is available
 	if userData != nil {
 		config["client_data"] = map[string]interface{}{
 			"dynamic_variables": map[string]string{
