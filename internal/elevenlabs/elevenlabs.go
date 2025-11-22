@@ -49,11 +49,13 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 }
 
 // GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
-// NOTE: we keep ElevenLabs on its default PCM 16k formats and handle μ-law conversion in Go.
+// NOTE:
+//   - input_audio_format  = "mulaw_8000"  (we send Twilio μ-law 8k directly)
+//   - output_audio_format = "pcm_16000"   (we convert this back to μ-law 8k before sending to Twilio)
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
 	config := map[string]interface{}{
-		"type":               "conversation_initiation_client_data",
-		"input_audio_format": "pcm_16000",
+		"type":                "conversation_initiation_client_data",
+		"input_audio_format":  "mulaw_8000",
 		"output_audio_format": "pcm_16000",
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
