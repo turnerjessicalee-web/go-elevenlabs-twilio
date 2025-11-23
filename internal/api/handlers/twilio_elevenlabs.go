@@ -493,7 +493,7 @@ func pcm16ToULaw8kBase64(pcm []byte) (string, error) {
 		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
 	}
 
-	// downsample 16k -> 8k by taking every 2nd sample (simple but fine for phone)
+	// downsample 16k -> 8k by taking every 2nd sample
 	down := make([]int16, len(samples)/2)
 	for i := range down {
 		down[i] = samples[i*2]
@@ -507,31 +507,38 @@ func pcm16ToULaw8kBase64(pcm []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(ulaw), nil
 }
 
-// standard G.711 µ-law encoder
+// standard G.711 µ-law encoder (all int math, then cast to byte)
 func linearToMuLaw(sample int16) byte {
 	const (
-		bias   = 0x84
-		clip   = 32635
-		signBit = 0x80
+		bias = 0x84
+		clip = 32635
 	)
 
-	sign := byte(0)
-	if sample < 0 {
-		sample = -sample
-		sign = signBit
-	}
-	if sample > clip {
-		sample = clip
-	}
-	sample = sample + bias
+	// promote to int for arithmetic
+	s := int(sample)
 
-	// convert linear to µ-law
-	segment := 7
-	for v := sample >> 7; v != 0 && segment > 0; v >>= 1 {
-		segment--
+	// sign bit
+	sign := 0
+	if s < 0 {
+		s = -s
+		sign = 0x80
 	}
-	mu := byte(((segment << 4) | ((sample >> (segment + 3)) & 0x0F)))
-	return ^(mu | sign)
+
+	if s > clip {
+		s = clip
+	}
+	s += bias
+
+	// find exponent
+	exponent := 7
+	for expMask := 0x4000; (s & expMask) == 0 && exponent > 0; exponent-- {
+		expMask >>= 1
+	}
+
+	mantissa := (s >> (exponent + 3)) & 0x0F
+	mu := byte(sign | (exponent << 4) | mantissa)
+
+	return ^mu
 }
 
 // -----------------------------------------------------------------------------
