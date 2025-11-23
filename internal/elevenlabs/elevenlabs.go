@@ -54,7 +54,6 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 
 	agentCfg := cfg["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
 
-	// Keep underlying prompt logic (general behaviour instructions)
 	var prompt string
 	if isInbound {
 		prompt, _ = generateInboundCallPrompt(fullName)
@@ -66,34 +65,18 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		"prompt": prompt,
 	}
 
-	// --- New: First spoken message (name-aware) ---
-	var firstMessage string
-	if firstName != "" {
-		firstMessage = fmt.Sprintf(
-			"Hi %s, it's Bellkeeper, your virtual receptionist. "+
-				"This is a quick live demo so you can experience how I can handle guest bookings. "+
-				"When you're ready, just say: 'I'd like to make a booking.'",
-			firstName,
-		)
-	} else {
-		firstMessage = "Hi, it's Bellkeeper, your virtual receptionist. " +
-			"This is a quick live demo so you can experience how I can handle guest bookings. " +
-			"When you're ready, just say: 'I'd like to make a booking.'"
-	}
-	agentCfg["first_message"] = firstMessage
-
 	// Pass client data if available
 	if userData != nil {
-		dynamic := map[string]string{
+		dynamicVars := map[string]string{
 			"caller_phone": callerPhone,
 			"caller_name":  fullName,
 		}
 		if email != "" {
-			dynamic["caller_email"] = email
+			dynamicVars["caller_email"] = email
 		}
 
 		cfg["client_data"] = map[string]interface{}{
-			"dynamic_variables": dynamic,
+			"dynamic_variables": dynamicVars,
 			"user_json":         mustJSON(userData),
 		}
 	}
@@ -103,22 +86,37 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 
 func generateInboundCallPrompt(name string) (string, error) {
 	prompt := `
-You are an AI Agent that is supportive and helpful.
-Your main task is to motivate the interlocutor whose name is %s to enjoy their life.
-Speak clearly, like a friendly human receptionist on a phone line.
-Pause to let them reply, and respond to what they actually say.
+You are Bellkeeper, an AI-powered virtual receptionist for motels.
+The caller's name is %s.
+
+Your job on INBOUND calls is to warmly greet the caller, understand whether they want to:
+- make a new booking
+- change or cancel an existing booking
+- ask a simple question
+
+Speak clearly and naturally, like a friendly human receptionist on a phone line.
+Use the caller's name once near the start, but not in every sentence.
+Ask short, direct questions and pause to let them reply. Do not talk over them.
 `
 	return fmt.Sprintf(prompt, name), nil
 }
 
 func generateOutboundCallPrompt(name string) (string, error) {
 	prompt := `
-You are an AI Agent that is supportive and helpful.
-You are calling %s on the phone.
-Speak clearly like a human, wait for their responses, and answer conversationally.
-Do not speak over the top of the other person.
+You are Bellkeeper, an AI-powered virtual receptionist for motels.
+You are calling a motel owner or manager for a live demo.
+Their name is %s.
+
+Your VERY FIRST spoken message to them MUST be exactly:
+
+"Hi %s, it’s Bellkeeper, your virtual receptionist. This is a quick live demo so you can experience how I can handle guest bookings. When you’re ready, just say: 'I’d like to make a booking.'"
+
+After that first message, stop speaking and wait for their response.
+Do not speak over the top of them.
+Keep all further responses short, warm and practical, like a professional front-desk host.
 `
-	return fmt.Sprintf(prompt, name), nil
+	// We want the name to appear twice in the scripted first line: once in the sentence and once in the explicit quote.
+	return fmt.Sprintf(prompt, name, name), nil
 }
 
 // helper to safely JSON encode into string
