@@ -3,64 +3,25 @@ package elevenlabs
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
 )
 
-// GetSignedElevenLabsURL retrieves a signed WebSocket URL from ElevenLabs.
-// This is still fine to use if your backend is calling the
-// /v1/convai/conversation/get_signed_url endpoint with an agent_id.
-func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
-	url := fmt.Sprintf("https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=%s", agentID)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", fmt.Errorf("error creating signed URL request: %w", err)
-	}
-
-	req.Header.Set("xi-api-key", apiKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("error getting signed URL: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-
-		log.Printf(
-			"[ElevenLabs] failed to get signed URL: status=%s body=%s",
-			resp.Status,
-			string(body),
-		)
-
-		return "", fmt.Errorf("failed to get signed URL: %s", resp.Status)
-	}
-
-	var result struct {
-		SignedURL string `json:"signed_url"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("error parsing signed URL response: %w", err)
-	}
-
-	return result.SignedURL, nil
+// GetRealtimeURL builds the ConvAI websocket URL (no signed URL needed)
+func GetRealtimeURL(agentID, apiKey string) string {
+	return fmt.Sprintf(
+		"wss://api.elevenlabs.io/v1/convai/conversation?agent_id=%s&api_key=%s",
+		agentID,
+		apiKey,
+	)
 }
 
-// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation.
-// IMPORTANT: Twilio uses G.711 μ-law. ElevenLabs ConvAI must be told "g711_ulaw"
-// for both input and output, otherwise you hear static.
+// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
+// IMPORTANT: input_audio_format matches Twilio (mulaw_8000)
+//            output_audio_format is pcm_16000 which we transcode to mulaw_8000 before sending to Twilio.
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
-	config := map[string]interface{}{
-		"type":               "conversation_initiation_client_data",
-		"input_audio_format": "g711_ulaw", // <-- key change
-		"output_audio_format": "g711_ulaw", // <-- key change
-
-		// We override the agent config mainly to inject a prompt.
-		// Your agent_id is supplied via the signed URL.
+	cfg := map[string]interface{}{
+		"type":                "conversation_initiation_client_data",
+		"input_audio_format":  "mulaw_8000",
+		"output_audio_format": "pcm_16000",
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
 		},
@@ -69,7 +30,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 	var firstName, lastName string
 
 	if userData != nil {
-		// Adapted from your existing shape: userData["debtor"]["first_name"] etc.
+		// If your user data has a different shape, adjust here
 		if debtor, ok := userData["debtor"].(map[string]interface{}); ok {
 			if fn, ok := debtor["first_name"].(string); ok {
 				firstName = fn
@@ -77,51 +38,50 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 			if ln, ok := debtor["last_name"].(string); ok {
 				lastName = ln
 			}
-		} else {
-			// Fallback for simpler shapes like {"first_name": "...", "last_name": "..."}
-			if fn, ok := userData["first_name"].(string); ok {
-				firstName = fn
-			}
-			if ln, ok := userData["last_name"].(string); ok {
-				lastName = ln
-			}
+		}
+		if fn, ok := userData["first_name"].(string); ok && firstName == "" {
+			firstName = fn
+		}
+		if ln, ok := userData["last_name"].(string); ok && lastName == "" {
+			lastName = ln
 		}
 	}
 
 	fullName := fmt.Sprintf("%s %s", firstName, lastName)
 
-	agentConfig := config["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
+	agentCfg := cfg["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
 
-	// Set prompt based on call direction
+	var prompt string
 	if isInbound {
-		inboundPrompt, _ := generateInboundCallPrompt(fullName)
-		agentConfig["prompt"] = map[string]interface{}{
-			"prompt": inboundPrompt,
-		}
+		prompt, _ = generateInboundCallPrompt(fullName)
 	} else {
-		outboundPrompt, _ := generateOutboundCallPrompt(fullName)
-		agentConfig["prompt"] = map[string]interface{}{
-			"prompt": outboundPrompt,
-		}
+		prompt, _ = generateOutboundCallPrompt(fullName)
 	}
 
-	// Add dynamic variables if user data is available
+	agentCfg["prompt"] = map[string]interface{}{
+		"prompt": prompt,
+	}
+
+	// Pass client data if available
 	if userData != nil {
-		config["client_data"] = map[string]interface{}{
+		cfg["client_data"] = map[string]interface{}{
 			"dynamic_variables": map[string]string{
 				"caller_phone": callerPhone,
 				"caller_name":  fullName,
 			},
+			"user_json": mustJSON(userData),
 		}
 	}
 
-	return config
+	return cfg
 }
 
 func generateInboundCallPrompt(name string) (string, error) {
 	prompt := `
 You are an AI Agent that is supportive and helpful.
 Your main task is to motivate the interlocutor whose name is %s to enjoy their life.
+Speak clearly, like a friendly human receptionist on a phone line.
+Pause to let them reply, and respond to what they actually say.
 `
 	return fmt.Sprintf(prompt, name), nil
 }
@@ -129,7 +89,18 @@ Your main task is to motivate the interlocutor whose name is %s to enjoy their l
 func generateOutboundCallPrompt(name string) (string, error) {
 	prompt := `
 You are an AI Agent that is supportive and helpful.
-Your main task is to motivate the interlocutor whose name is %s to enjoy their life.
+You are calling %s on the phone.
+Speak clearly like a human, wait for their responses, and answer conversationally.
+Do not speak over the top of the other person.
 `
 	return fmt.Sprintf(prompt, name), nil
+}
+
+// helper to safely JSON encode into string
+func mustJSON(v interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
