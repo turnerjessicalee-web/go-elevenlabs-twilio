@@ -24,7 +24,7 @@ import (
 // EchoMode:
 //   - true  => just echo caller audio back (no ElevenLabs, good for testing Twilio <-> Go)
 //   - false => full Twilio <-> ElevenLabs bridge
-const EchoMode = true
+const EchoMode = false
 
 // ConversationData represents a call session
 type ConversationData struct {
