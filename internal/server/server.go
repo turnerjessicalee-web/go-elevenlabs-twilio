@@ -1,54 +1,58 @@
 package server
 
 import (
-    "context"
-    "fmt"
-    "net/http"
-    "os"
+	"caller/internal/api/handlers"
+	"caller/internal/config"
+	"log"
+	"net/http"
+	"os"
 
-    "caller/internal/api"
-    "caller/internal/config"
-
-    "github.com/gorilla/websocket"
+	"github.com/gorilla/websocket"
 )
 
-type Server struct {
-    cfg      *config.Config
-    srv      *http.Server
-    upgrader websocket.Upgrader
-}
+// Run starts the HTTP server and wires up all routes.
+func Run() {
+	// Load config (adjust if your Config loader is different)
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("[Server] Failed to load config: %v", err)
+	}
 
-func New(cfg *config.Config) (*Server, error) {
-    s := &Server{
-        cfg: cfg,
-        upgrader: websocket.Upgrader{
-            CheckOrigin: func(r *http.Request) bool {
-                return true // allow all origins for now
-            },
-        },
-    }
+	// WebSocket upgrader for Twilio media stream
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			// Twilio will connect from various IPs, so we typically allow all origins here.
+			return true
+		},
+	}
 
-    router := api.NewRouter(s.cfg, s.upgrader)
+	mux := http.NewServeMux()
 
-    // Use Render's PORT if present, otherwise fall back to cfg.Port (10000 for local dev)
-    port := os.Getenv("PORT")
-    if port == "" {
-        port = cfg.Port
-    }
+	// Inbound call webhook (Twilio hits this when someone calls your Twilio number)
+	mux.Handle("/incoming-call", handlers.HandleIncomingCall())
 
-    s.srv = &http.Server{
-        Addr:    "0.0.0.0:" + port,
-        Handler: router,
-    }
+	// Twilio <-> Go <-> ElevenLabs media WebSocket bridge
+	mux.Handle("/media-stream", handlers.HandleMediaStream(upgrader, cfg))
 
-    return s, nil
-}
+	// Outbound call initiation (your app hits this to start a call via Twilio)
+	mux.Handle("/outbound-call", handlers.HandleOutboundCall(cfg))
 
-func (s *Server) Start() error {
-    fmt.Printf("[Server] Listening on port %s\n", s.srv.Addr)
-    return s.srv.ListenAndServe()
-}
+	// TwiML endpoint for outbound calls (Twilio calls this to get <Connect><Stream> TwiML)
+	mux.Handle("/outbound-call-twiml", handlers.HandleOutboundCallTwiml())
 
-func (s *Server) Shutdown(ctx context.Context) error {
-    return s.srv.Shutdown(ctx)
+	// Simple health check (optional but handy for Render)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("[Server] Listening on :%s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatalf("[Server] ListenAndServe error: %v", err)
+	}
 }
