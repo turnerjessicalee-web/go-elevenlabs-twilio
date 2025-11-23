@@ -3,6 +3,7 @@ package server
 import (
 	"caller/internal/api/handlers"
 	"caller/internal/config"
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -10,18 +11,17 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Run starts the HTTP server and wires up all routes.
-func Run() {
-	// Load config (adjust if your Config loader is different)
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("[Server] Failed to load config: %v", err)
-	}
+// Server wraps the underlying HTTP server.
+type Server struct {
+	httpServer *http.Server
+}
 
+// New constructs a new Server with routes wired up.
+func New(cfg *config.Config) (*Server, error) {
 	// WebSocket upgrader for Twilio media stream
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			// Twilio will connect from various IPs, so we typically allow all origins here.
+			// Twilio connects from various IPs; typically allow all origins here.
 			return true
 		},
 	}
@@ -40,7 +40,7 @@ func Run() {
 	// TwiML endpoint for outbound calls (Twilio calls this to get <Connect><Stream> TwiML)
 	mux.Handle("/outbound-call-twiml", handlers.HandleOutboundCallTwiml())
 
-	// Simple health check (optional but handy for Render)
+	// Simple health check (useful for Render)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
@@ -51,8 +51,31 @@ func Run() {
 		port = "8080"
 	}
 
-	log.Printf("[Server] Listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		log.Fatalf("[Server] ListenAndServe error: %v", err)
+	httpSrv := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
 	}
+
+	log.Printf("[Server] Initialised on :%s", port)
+
+	return &Server{
+		httpServer: httpSrv,
+	}, nil
+}
+
+// Start begins serving HTTP requests.
+func (s *Server) Start() error {
+	log.Printf("[Server] Listening on %s", s.httpServer.Addr)
+	// ListenAndServe returns http.ErrServerClosed on graceful shutdown,
+	// which we usually don't treat as a fatal error.
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// Shutdown gracefully stops the server.
+func (s *Server) Shutdown(ctx context.Context) error {
+	log.Println("[Server] Shutting down...")
+	return s.httpServer.Shutdown(ctx)
 }
