@@ -3,6 +3,7 @@ package elevenlabs
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // GetRealtimeURL builds the ConvAI websocket URL (no signed URL needed)
@@ -17,7 +18,15 @@ func GetRealtimeURL(agentID, apiKey string) string {
 // GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
 // IMPORTANT: input_audio_format matches Twilio (mulaw_8000)
 //            output_audio_format is pcm_16000 which we transcode to mulaw_8000 before sending to Twilio.
-func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
+//
+// firstNameOverride comes from your outbound flow (e.g. Carrd/Make).
+// If it's non-empty, we prefer it over anything in userData.
+func GenerateElevenLabsConfig(
+	userData map[string]interface{},
+	callerPhone string,
+	isInbound bool,
+	firstNameOverride string,
+) map[string]interface{} {
 	cfg := map[string]interface{}{
 		"type":                "conversation_initiation_client_data",
 		"input_audio_format":  "mulaw_8000",
@@ -29,7 +38,13 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 
 	var firstName, lastName string
 
-	if userData != nil {
+	// 1) Prefer explicit first name from the outbound payload
+	if strings.TrimSpace(firstNameOverride) != "" {
+		firstName = strings.TrimSpace(firstNameOverride)
+	}
+
+	// 2) Fall back to userData if we didn't get an explicit first name
+	if userData != nil && firstName == "" {
 		// If your user data has a different shape, adjust here
 		if debtor, ok := userData["debtor"].(map[string]interface{}); ok {
 			if fn, ok := debtor["first_name"].(string); ok {
@@ -47,60 +62,6 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		}
 	}
 
-	fullName := fmt.Sprintf("%s %s", firstName, lastName)
-
-	agentCfg := cfg["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
-
-	var prompt string
-	if isInbound {
-		prompt, _ = generateInboundCallPrompt(fullName)
-	} else {
-		prompt, _ = generateOutboundCallPrompt(fullName)
-	}
-
-	agentCfg["prompt"] = map[string]interface{}{
-		"prompt": prompt,
-	}
-
-	// Pass client data if available
-	if userData != nil {
-		cfg["client_data"] = map[string]interface{}{
-			"dynamic_variables": map[string]string{
-				"caller_phone": callerPhone,
-				"caller_name":  fullName,
-			},
-			"user_json": mustJSON(userData),
-		}
-	}
-
-	return cfg
-}
-
-func generateInboundCallPrompt(name string) (string, error) {
-	prompt := `
-You are an AI Agent that is supportive and helpful.
-Your main task is to motivate the interlocutor whose name is %s to enjoy their life.
-Speak clearly, like a friendly human receptionist on a phone line.
-Pause to let them reply, and respond to what they actually say.
-`
-	return fmt.Sprintf(prompt, name), nil
-}
-
-func generateOutboundCallPrompt(name string) (string, error) {
-	prompt := `
-You are an AI Agent that is supportive and helpful.
-You are calling %s on the phone.
-Speak clearly like a human, wait for their responses, and answer conversationally.
-Do not speak over the top of the other person.
-`
-	return fmt.Sprintf(prompt, name), nil
-}
-
-// helper to safely JSON encode into string
-func mustJSON(v interface{}) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "{}"
-	}
-	return string(b)
-}
+	fullName := strings.TrimSpace(fmt.Sprintf("%s %s", firstName, lastName))
+	if fullName == "" {
+		fullName
