@@ -118,7 +118,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			isDisconnecting = false
 			mu              sync.Mutex
 
-			// latency tracking (per call)
 			lastUserAudioTime time.Time
 		)
 
@@ -149,7 +148,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				conversations.Delete(streamSid)
 			}
 
-			// Tell Twilio to hang up
 			msgs := []map[string]interface{}{
 				{"event": "mark_done", "streamSid": streamSid},
 				{"event": "clear", "streamSid": streamSid},
@@ -239,7 +237,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 
 				log.Println("[Server] ElevenLabs bridge ENABLED")
 
-				// Connect to ElevenLabs ConvAI
 				wsURL := elevenlabs.GetRealtimeURL(cfg.ElevenLabsAgentID, cfg.ElevenLabsAPIKey)
 				elevenConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
 				if err != nil {
@@ -249,7 +246,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				}
 				log.Println("[ElevenLabs] WebSocket connected")
 
-				// send configuration
 				isInbound := direction == "inbound"
 				configMsg := elevenlabs.GenerateElevenLabsConfig(userData, callerPhone, isInbound)
 
@@ -259,7 +255,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					continue
 				}
 
-				// start reader for ElevenLabs
 				go handleElevenLabsMessages(elevenConn, twilioConn, conversation, disconnectCall, &lastUserAudioTime)
 
 			case "media":
@@ -274,12 +269,10 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 
 				if EnableLatencyDebug {
 					lastUserAudioTime = time.Now()
-					log.Printf("[Latency] TWILIO_IN media at %v (len=%d bytes base64)",
-						lastUserAudioTime.Format(time.RFC3339Nano), len(payload))
+					log.Printf("[Latency] TWILIO_IN media at %s (len=%d bytes base64)", lastUserAudioTime.Format(time.RFC3339Nano), len(payload))
 				}
 
 				if EchoMode {
-					// Simple echo for debugging
 					resp := map[string]interface{}{
 						"event":     "media",
 						"streamSid": streamSid,
@@ -293,7 +286,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					continue
 				}
 
-				// Forward to ElevenLabs
 				if elevenConn != nil {
 					msg := map[string]string{
 						"user_audio_chunk": payload,
@@ -301,8 +293,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					if err := elevenConn.WriteJSON(msg); err != nil {
 						log.Printf("[ElevenLabs] Error sending audio: %v", err)
 					} else if EnableLatencyDebug {
-						log.Printf("[Latency] EL_OUT user_audio_chunk at %v",
-							time.Now().Format(time.RFC3339Nano))
+						log.Printf("[Latency] EL_OUT user_audio_chunk at %s", time.Now().Format(time.RFC3339Nano))
 					}
 				}
 
@@ -436,7 +427,6 @@ func handleElevenLabsMessages(
 			if ev, ok := data["audio_event"].(map[string]interface{}); ok {
 				audioB64, _ = ev["audio_base_64"].(string)
 			} else if audio, ok := data["audio"].(map[string]interface{}); ok {
-				// older / alternative naming
 				audioB64, _ = audio["chunk"].(string)
 			}
 
@@ -447,7 +437,178 @@ func handleElevenLabsMessages(
 			if EnableLatencyDebug {
 				if lastUserAudioTime != nil && !lastUserAudioTime.IsZero() {
 					delta := now.Sub(*lastUserAudioTime)
-					log.Printf("[Latency] EL_IN audio at %v; time since last TWILIO_IN media: %s",
-						now.Format(time.RFC3339Nano), delta.String())
+					log.Printf("[Latency] EL_IN audio at %s; time since last TWILIO_IN media: %s", now.Format(time.RFC3339Nano), delta.String())
 				} else {
-					log.Printf("[Latency] EL_IN audio at %v; no last TWILIO_I
+					log.Printf("[Latency] EL_IN audio at %s; no last TWILIO_IN timestamp recorded", now.Format(time.RFC3339Nano))
+				}
+			}
+
+			pcmBytes, err := base64.StdEncoding.DecodeString(audioB64)
+			if err != nil {
+				log.Printf("[ElevenLabs] Error decoding audio base64: %v", err)
+				continue
+			}
+
+			ulawB64, err := pcm16ToULaw8kBase64(pcmBytes)
+			if err != nil {
+				log.Printf("[Transcode] Error transcoding ElevenLabs audio: %v", err)
+				continue
+			}
+
+			resp := map[string]interface{}{
+				"event":     "media",
+				"streamSid": conversation.StreamSid,
+				"media": map[string]string{
+					"payload": ulawB64,
+				},
+			}
+
+			sendStart := time.Now()
+			if err := twilioConn.WriteJSON(resp); err != nil {
+				log.Printf("[Twilio] Error sending media: %v", err)
+			} else if EnableLatencyDebug {
+				log.Printf("[Latency] TWILIO_OUT media at %s (send duration: %s)", time.Now().Format(time.RFC3339Nano), time.Since(sendStart).String())
+			}
+
+		case "interruption":
+			clearMsg := map[string]interface{}{
+				"event":     "clear",
+				"streamSid": conversation.StreamSid,
+			}
+			if err := twilioConn.WriteJSON(clearMsg); err != nil {
+				log.Printf("[Twilio] Error sending clear: %v", err)
+			}
+
+		case "ping":
+			if ev, ok := data["ping_event"].(map[string]interface{}); ok {
+				if id, ok := ev["event_id"].(string); ok {
+					pong := map[string]interface{}{
+						"type":     "pong",
+						"event_id": id,
+					}
+					if err := elevenConn.WriteJSON(pong); err != nil {
+						log.Printf("[ElevenLabs] Error sending pong: %v", err)
+					}
+				}
+			}
+
+		case "end_of_conversation":
+			log.Println("[ElevenLabs] End of conversation")
+			disconnectFunc()
+			return
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// AUDIO TRANSCODING HELPERS (PCM16 16k -> µ-law 8k)
+// -----------------------------------------------------------------------------
+
+// pcm16ToULaw8kBase64 takes raw little-endian PCM16 at 16kHz and returns base64 µ-law at 8kHz
+func pcm16ToULaw8kBase64(pcm []byte) (string, error) {
+	if len(pcm)%2 != 0 {
+		pcm = pcm[:len(pcm)-1]
+	}
+	samples := make([]int16, len(pcm)/2)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
+	}
+
+	down := make([]int16, len(samples)/2)
+	for i := range down {
+		down[i] = samples[i*2]
+	}
+
+	ulaw := make([]byte, len(down))
+	for i, s := range down {
+		ulaw[i] = linearToMuLaw(s)
+	}
+
+	return base64.StdEncoding.EncodeToString(ulaw), nil
+}
+
+// standard G.711 µ-law encoder (all int math, then cast to byte)
+func linearToMuLaw(sample int16) byte {
+	const (
+		bias = 0x84
+		clip = 32635
+	)
+
+	s := int(sample)
+
+	sign := 0
+	if s < 0 {
+		s = -s
+		sign = 0x80
+	}
+
+	if s > clip {
+		s = clip
+	}
+	s += bias
+
+	exponent := 7
+	for expMask := 0x4000; (s&expMask) == 0 && exponent > 0; exponent-- {
+		expMask >>= 1
+	}
+
+	mantissa := (s >> (exponent + 3)) & 0x0F
+	mu := byte(sign | (exponent << 4) | mantissa)
+
+	return ^mu
+}
+
+// -----------------------------------------------------------------------------
+// TWILIO API + MOCK HELPERS
+// -----------------------------------------------------------------------------
+
+func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
+	client := &http.Client{}
+	form := url.Values{}
+	for k, v := range params {
+		form.Add(k, v)
+	}
+
+	req, err := http.NewRequest(
+		"POST",
+		fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json", accountSid),
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(accountSid, authToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func checkUserExists(phone string) (map[string]interface{}, error) {
+	log.Printf("[Mock] Checking if user exists with phone: %s", phone)
+	return map[string]interface{}{
+		"first_name": "John",
+		"last_name":  "Doe",
+		"phone":      phone,
+	}, nil
+}
+
+func sendConversationWebhook(payload map[string]interface{}, endpoint string, authToken string) error {
+	log.Printf("[Mock Webhook] Sending payload to %s: %+v", endpoint, payload)
+	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
+	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
+	return nil
+}
