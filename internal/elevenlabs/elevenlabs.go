@@ -30,7 +30,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 	var firstName, lastName, email string
 
 	if userData != nil {
-		// If your user data has a different shape, adjust here
+		// Optional nested debtor object for flexibility
 		if debtor, ok := userData["debtor"].(map[string]interface{}); ok {
 			if fn, ok := debtor["first_name"].(string); ok {
 				firstName = fn
@@ -39,6 +39,8 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 				lastName = ln
 			}
 		}
+
+		// Flat fields
 		if fn, ok := userData["first_name"].(string); ok && firstName == "" {
 			firstName = fn
 		}
@@ -50,6 +52,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		}
 	}
 
+	// Build a decent display name
 	fullName := firstName
 	if lastName != "" {
 		if fullName != "" {
@@ -61,24 +64,12 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 
 	agentCfg := cfg["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
 
-	// -----------------------------
-	// Prompt (general behaviour)
-	// -----------------------------
-	var prompt string
-	if isInbound {
-		prompt, _ = generateInboundCallPrompt(fullName)
-	} else {
-		prompt, _ = generateOutboundCallPrompt(fullName)
-	}
-	agentCfg["prompt"] = map[string]interface{}{
-		"prompt": prompt,
-	}
-
-	// -----------------------------
-	// FIRST MESSAGE OVERRIDE
-	// -----------------------------
-	// ElevenLabs has a dedicated "first_message" field that controls what it says first.
-	// We override that here for OUTBOUND demo calls so it ALWAYS uses your scripted intro.
+	// ------------------------------------------------
+	// FIRST MESSAGE ONLY (do NOT override base prompt)
+	// ------------------------------------------------
+	// Let the ElevenLabs UI “Agent instructions / System prompt”
+	// control behaviour and rules. Here we only override the
+	// very first utterance on OUTBOUND calls to personalise it.
 	if !isInbound {
 		introName := firstName
 		if introName == "" {
@@ -93,9 +84,9 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		)
 	}
 
-	// -----------------------------
-	// Client data / dynamic vars
-	// -----------------------------
+	// ------------------------------------------------
+	// Client data / dynamic variables
+	// ------------------------------------------------
 	if userData != nil {
 		dynamicVars := map[string]string{
 			"caller_phone": callerPhone,
@@ -112,39 +103,6 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 	}
 
 	return cfg
-}
-
-func generateInboundCallPrompt(name string) (string, error) {
-	prompt := `
-You are Bellkeeper, an AI-powered virtual receptionist for motels.
-
-If the caller's name is provided, their name is %s. Use it once near the start of the call, but not in every sentence.
-
-Your job on INBOUND calls is to warmly greet the caller and quickly understand whether they want to:
-- make a new booking
-- change or cancel an existing booking
-- ask a simple question
-
-Speak clearly and naturally, like a friendly human receptionist on a phone line.
-Ask short, direct questions and pause to let them reply. Do not talk over them.
-`
-	return fmt.Sprintf(prompt, name), nil
-}
-
-func generateOutboundCallPrompt(name string) (string, error) {
-	prompt := `
-You are Bellkeeper, an AI-powered virtual receptionist for motels.
-You are calling a motel owner or manager for a live demo.
-
-If their name is provided, their name is %s.
-
-After your FIRST MESSAGE (which is separately configured), you should:
-- keep responses short, warm and practical
-- focus on helping them experience how you would handle a guest booking
-- not speak over the top of them
-- ask clear, simple questions to move the booking forward
-`
-	return fmt.Sprintf(prompt, name), nil
 }
 
 // helper to safely JSON encode into string
