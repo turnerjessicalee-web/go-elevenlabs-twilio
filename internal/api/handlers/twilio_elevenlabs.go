@@ -334,26 +334,14 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
-		// Build a small user data blob for outbound calls so ElevenLabs gets name/email
-		userData := map[string]interface{}{}
-		if req.FirstName != "" {
-			userData["first_name"] = req.FirstName
-		}
-		if req.Email != "" {
-			userData["email"] = req.Email
-		}
-		userDataJSON, _ := json.Marshal(userData)
-		escapedUserData := url.QueryEscape(string(userDataJSON))
-
-		// Pass normalized number + name + email into the TwiML endpoint
+		// Build TwiML URL (no user_data in query; we build it in the TwiML handler)
 		callURL := fmt.Sprintf(
-			"https://%s/outbound-call-twiml?number=%s&first_name=%s&email=%s&prompt=%s&user_data=%s",
+			"https://%s/outbound-call-twiml?number=%s&first_name=%s&email=%s&prompt=%s",
 			r.Host,
 			url.QueryEscape(normalizedNumber),
 			url.QueryEscape(req.FirstName),
 			url.QueryEscape(req.Email),
 			url.QueryEscape(req.Prompt),
-			escapedUserData,
 		)
 
 		params := map[string]string{
@@ -384,22 +372,17 @@ func HandleOutboundCallTwiml() http.Handler {
 		number := r.URL.Query().Get("number") // already normalized
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
-		userDataStr := r.URL.Query().Get("user_data")
 
-		// If user_data came in, just pass it straight through to the stream as user_data
-		userDataValue := userDataStr
-		if userDataValue == "" {
-			// fallback: rebuild minimal structure
-			userData := map[string]interface{}{}
-			if firstName != "" {
-				userData["first_name"] = firstName
-			}
-			if email != "" {
-				userData["email"] = email
-			}
-			b, _ := json.Marshal(userData)
-			userDataValue = url.QueryEscape(string(b))
+		// Build user_data JSON from query params (so ElevenLabs can see name/email)
+		userData := map[string]interface{}{}
+		if firstName != "" {
+			userData["first_name"] = firstName
 		}
+		if email != "" {
+			userData["email"] = email
+		}
+		userDataJSON, _ := json.Marshal(userData)
+		escapedUserData := url.QueryEscape(string(userDataJSON))
 
 		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -414,7 +397,7 @@ func HandleOutboundCallTwiml() http.Handler {
 </Response>`,
 			r.Host,
 			number,
-			userDataValue,
+			escapedUserData,
 			url.QueryEscape(prompt),
 		)
 
@@ -424,7 +407,7 @@ func HandleOutboundCallTwiml() http.Handler {
 }
 
 // -----------------------------------------------------------------------------
-// ElevenLabs → Twilio bridge (with PCM16 -> µ-law 8k transcoding)
+// ElevenLabs → Twilio bridge (with PCM16 -> µ-law 8k)
 // -----------------------------------------------------------------------------
 
 func handleElevenLabsMessages(
@@ -592,7 +575,7 @@ func linearToMuLaw(sample int16) byte {
 	s += bias
 
 	exponent := 7
-	for expMask := 0x4000; (s&expMask) == 0 && exponent > 0; exponent-- {
+	for expMask := 0x4000; (s & expMask) == 0 && exponent > 0; exponent-- {
 		expMask >>= 1
 	}
 
@@ -694,10 +677,8 @@ func createTwilioCall(params map[string]string, accountSid, authToken string) (m
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	respClose := resp.Body.Close
+	defer respClose()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
