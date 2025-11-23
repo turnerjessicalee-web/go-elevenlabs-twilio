@@ -3,6 +3,8 @@ package handlers
 import (
 	"caller/internal/config"
 	"caller/internal/elevenlabs"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,11 +17,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Toggle: when true = pure echo (no ElevenLabs).
-// When false = full Twilio <-> ElevenLabs bridge.
+// -----------------------------------------------------------------------------
+// GLOBALS / TYPES
+// -----------------------------------------------------------------------------
+
+// EchoMode:
+//   - true  => just echo caller audio back (no ElevenLabs, good for testing Twilio <-> Go)
+//   - false => full Twilio <-> ElevenLabs bridge
 const EchoMode = false
 
-// ConversationData represents a call session with identifiers/metadata.
+// ConversationData represents a call session
 type ConversationData struct {
 	StreamSid      string
 	CallSid        string
@@ -31,7 +38,11 @@ type ConversationData struct {
 
 var conversations sync.Map
 
-// HandleIncomingCall processes webhook requests from Twilio when someone calls our number.
+// -----------------------------------------------------------------------------
+// INBOUND CALL HANDLER
+// -----------------------------------------------------------------------------
+
+// HandleIncomingCall processes webhook requests from Twilio when someone calls
 func HandleIncomingCall() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -42,174 +53,187 @@ func HandleIncomingCall() http.Handler {
 		callerPhone := r.FormValue("From")
 		log.Printf("[Twilio] Incoming call from: %s", callerPhone)
 
-		// For now we skip auth and always connect to media stream.
+		userData, err := checkUserExists(callerPhone)
+		if err != nil || userData == nil {
+			twiml := `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Sorry, you are not authorized to make this call.</Say>
+    <Hangup />
+</Response>`
+			w.Header().Set("Content-Type", "text/xml")
+			_, _ = w.Write([]byte(twiml))
+			return
+		}
+
+		userDataJSON, _ := json.Marshal(userData)
+
 		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 	<Connect>
 		<Stream url="wss://%s/media-stream">
 			<Parameter name="caller_phone" value="%s" />
+			<Parameter name="user_data" value="%s" />
 			<Parameter name="direction" value="inbound" />
 		</Stream>
 	</Connect>
-</Response>`, r.Host, callerPhone)
+</Response>`,
+			r.Host,
+			callerPhone,
+			url.QueryEscape(string(userDataJSON)),
+		)
 
 		w.Header().Set("Content-Type", "text/xml")
 		_, _ = w.Write([]byte(twiml))
 	})
 }
 
-// HandleMediaStream upgrades HTTP -> WebSocket and routes audio
-// between Twilio and ElevenLabs (or echo, depending on EchoMode).
+// -----------------------------------------------------------------------------
+// MEDIA STREAM HANDLER (Twilio <-> ElevenLabs bridge)
+// -----------------------------------------------------------------------------
+
 func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
+		twilioConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("[WebSocket] Error upgrading connection: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer twilioConn.Close()
 
 		log.Println("[Server] Twilio connected to media stream")
-		if EchoMode {
-			log.Println("[Server] EchoMode ENABLED (no ElevenLabs)")
-		} else {
-			log.Println("[Server] ElevenLabs bridge ENABLED")
-		}
 
 		var (
 			streamSid       string
 			callSid         string
+			elevenConn      *websocket.Conn
 			callerPhone     = "Unknown"
+			userData        map[string]interface{}
 			direction       = "inbound"
 			conversation    *ConversationData
-			elevenLabsWs    *websocket.Conn
 			isDisconnecting = false
-			disconnectMutex sync.Mutex
+			mu              sync.Mutex
 		)
 
 		disconnectCall := func() {
-			disconnectMutex.Lock()
-			defer disconnectMutex.Unlock()
-
+			mu.Lock()
 			if isDisconnecting {
+				mu.Unlock()
 				return
 			}
 			isDisconnecting = true
+			mu.Unlock()
 
 			log.Println("[Twilio] Initiating call disconnect")
 
-			// Close ElevenLabs WS if present
-			if elevenLabsWs != nil {
-				_ = elevenLabsWs.WriteJSON(map[string]interface{}{
-					"type": "end_of_conversation",
-				})
-				_ = elevenLabsWs.Close()
+			if elevenConn != nil {
+				_ = elevenConn.WriteJSON(map[string]string{"type": "end_of_conversation"})
+				_ = elevenConn.Close()
 			}
 
-			if conversation != nil && conversation.StreamSid != "" {
-				conversations.Delete(conversation.StreamSid)
-			}
-
-			if streamSid != "" {
-				// mark_done + hangup; omit "clear" to avoid Twilio warnings.
-				messages := []map[string]interface{}{
-					{"event": "mark_done", "streamSid": streamSid},
-					{"event": "twiml", "streamSid": streamSid, "twiml": "<Response><Hangup/></Response>"},
+			if conversation != nil && conversation.ConversationID != "" {
+				payload := map[string]interface{}{
+					"conversation_id": conversation.ConversationID,
+					"phone_number":    conversation.CallerPhone,
+					"call_sid":        conversation.CallSid,
+					"direction":       conversation.Direction,
 				}
-				for _, msg := range messages {
-					if err := conn.WriteJSON(msg); err != nil {
-						log.Printf("[Twilio] Error sending disconnect message: %v", err)
-					}
+				_ = sendConversationWebhook(payload, conversation.Direction+"-calls", "123123")
+				conversations.Delete(streamSid)
+			}
+
+			// Tell Twilio to hang up
+			msgs := []map[string]interface{}{
+				{"event": "mark_done", "streamSid": streamSid},
+				{"event": "clear", "streamSid": streamSid},
+				{"event": "twiml", "streamSid": streamSid, "twiml": "<Response><Hangup/></Response>"},
+			}
+			for _, m := range msgs {
+				if err := twilioConn.WriteJSON(m); err != nil {
+					log.Printf("[Twilio] Error sending disconnect message: %v", err)
 				}
 			}
 
-			time.AfterFunc(1*time.Second, func() {
-				_ = conn.Close()
+			time.AfterFunc(time.Second, func() {
+				_ = twilioConn.Close()
 			})
 		}
 
 		for {
-			messageType, message, err := conn.ReadMessage()
+			msgType, raw, err := twilioConn.ReadMessage()
 			if err != nil {
 				log.Printf("[Twilio] WebSocket error: %v", err)
 				break
 			}
-
-			if messageType != websocket.TextMessage {
+			if msgType != websocket.TextMessage {
 				continue
 			}
 
-            // Twilio frames are JSON text
 			var data map[string]interface{}
-			if err := json.Unmarshal(message, &data); err != nil {
+			if err := json.Unmarshal(raw, &data); err != nil {
 				log.Printf("[Twilio] Error parsing message: %v", err)
 				continue
 			}
 
-			event, ok := data["event"].(string)
-			if !ok {
+			event, _ := data["event"].(string)
+			if event == "" {
 				continue
 			}
 
-			log.Printf("[Twilio] Received event: %s", event)
-
-			disconnectMutex.Lock()
-			localIsDisconnecting := isDisconnecting
-			disconnectMutex.Unlock()
-
-			if localIsDisconnecting && event != "stop" {
+			mu.Lock()
+			localDisconnecting := isDisconnecting
+			mu.Unlock()
+			if localDisconnecting && event != "stop" {
 				continue
 			}
 
 			switch event {
 			case "start":
-				startData, ok := data["start"].(map[string]interface{})
+				start, ok := data["start"].(map[string]interface{})
 				if !ok {
-					log.Println("[Twilio] Invalid start data")
+					log.Println("[Twilio] Invalid start event")
 					continue
 				}
 
-				if sid, ok := startData["streamSid"].(string); ok {
-					streamSid = sid
-				}
-				if cs, ok := startData["callSid"].(string); ok {
+				streamSid, _ = start["streamSid"].(string)
+				if cs, ok := start["callSid"].(string); ok {
 					callSid = cs
 				}
 
-				customParams, _ := startData["customParameters"].(map[string]interface{})
-
-				if phone, ok := customParams["caller_phone"].(string); ok {
+				custom, _ := start["customParameters"].(map[string]interface{})
+				if phone, ok := custom["caller_phone"].(string); ok {
 					callerPhone = phone
 				}
-				if dir, ok := customParams["direction"].(string); ok {
+				if dir, ok := custom["direction"].(string); ok {
 					direction = dir
+				}
+
+				if userStr, ok := custom["user_data"].(string); ok && userStr != "" {
+					if decoded, err := url.QueryUnescape(userStr); err == nil {
+						if err := json.Unmarshal([]byte(decoded), &userData); err != nil {
+							log.Printf("[Twilio] Error parsing user_data: %v", err)
+						}
+					}
 				}
 
 				conversation = &ConversationData{
 					StreamSid:   streamSid,
 					CallSid:     callSid,
 					CallerPhone: callerPhone,
+					UserData:    userData,
 					Direction:   direction,
 				}
 				conversations.Store(streamSid, conversation)
 
-				log.Printf("[Twilio] Stream started - SID: %s, Phone: %s, Direction: %s", streamSid, callerPhone, direction)
-
-				// If EchoMode, we don't touch ElevenLabs.
 				if EchoMode {
+					log.Println("[Server] EchoMode ENABLED (no ElevenLabs)")
 					continue
 				}
 
-				// ---- ElevenLabs ConvAI setup ----
+				log.Println("[Server] ElevenLabs bridge ENABLED")
 
-				signedURL, err := elevenlabs.GetSignedElevenLabsURL(cfg.ElevenLabsAgentID, cfg.ElevenLabsAPIKey)
-				if err != nil {
-					log.Printf("[ElevenLabs] Error getting signed URL: %v", err)
-					disconnectCall()
-					continue
-				}
-
-				elevenLabsWs, _, err = websocket.DefaultDialer.Dial(signedURL, nil)
+				// Connect to ElevenLabs ConvAI
+				wsURL := elevenlabs.GetRealtimeURL(cfg.ElevenLabsAgentID, cfg.ElevenLabsAPIKey)
+				elevenConn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
 				if err != nil {
 					log.Printf("[ElevenLabs] Error connecting: %v", err)
 					disconnectCall()
@@ -217,50 +241,50 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				}
 				log.Println("[ElevenLabs] WebSocket connected")
 
+				// send configuration
 				isInbound := direction == "inbound"
-				// We don't have rich userData here yet, so pass nil.
-				elConfig := elevenlabs.GenerateElevenLabsConfig(nil, callerPhone, isInbound)
+				configMsg := elevenlabs.GenerateElevenLabsConfig(userData, callerPhone, isInbound)
 
-				if err := elevenLabsWs.WriteJSON(elConfig); err != nil {
+				if err := elevenConn.WriteJSON(configMsg); err != nil {
 					log.Printf("[ElevenLabs] Error sending config: %v", err)
 					disconnectCall()
 					continue
 				}
 
-				go handleElevenLabsMessages(elevenLabsWs, conn, conversation, disconnectCall)
+				// start reader for ElevenLabs
+				go handleElevenLabsMessages(elevenConn, twilioConn, conversation, disconnectCall)
 
 			case "media":
-				mediaData, ok := data["media"].(map[string]interface{})
+				media, ok := data["media"].(map[string]interface{})
 				if !ok {
-					log.Println("[Twilio] Invalid media data")
 					continue
 				}
-				payload, ok := mediaData["payload"].(string)
-				if !ok || payload == "" {
-					log.Println("[Twilio] Invalid media payload")
+				payload, _ := media["payload"].(string)
+				if payload == "" {
 					continue
 				}
 
-				// Always: if EchoMode, send echo back to Twilio.
-				if EchoMode && streamSid != "" {
-					echoMsg := map[string]interface{}{
+				if EchoMode {
+					// Simple echo for debugging
+					resp := map[string]interface{}{
 						"event":     "media",
 						"streamSid": streamSid,
 						"media": map[string]string{
 							"payload": payload,
 						},
 					}
-					if err := conn.WriteJSON(echoMsg); err != nil {
-						log.Printf("[Echo] Error sending echo media: %v", err)
+					if err := twilioConn.WriteJSON(resp); err != nil {
+						log.Printf("[Twilio] Error sending echo: %v", err)
 					}
+					continue
 				}
 
-				// When not EchoMode, forward user audio to ElevenLabs.
-				if !EchoMode && elevenLabsWs != nil {
-					audioMessage := map[string]string{
-						"user_audio_chunk": payload, // ConvAI mulaw_8000 base64 chunk
+				// Forward to ElevenLabs
+				if elevenConn != nil {
+					msg := map[string]string{
+						"user_audio_chunk": payload,
 					}
-					if err := elevenLabsWs.WriteJSON(audioMessage); err != nil {
+					if err := elevenConn.WriteJSON(msg); err != nil {
 						log.Printf("[ElevenLabs] Error sending audio: %v", err)
 					}
 				}
@@ -274,7 +298,10 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 	})
 }
 
-// HandleOutboundCall initiates calls from our system to specified phone numbers.
+// -----------------------------------------------------------------------------
+// OUTBOUND CALL HANDLERS
+// -----------------------------------------------------------------------------
+
 func HandleOutboundCall(cfg *config.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -286,14 +313,16 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-
 		if req.Number == "" {
 			http.Error(w, "Phone number is required", http.StatusBadRequest)
 			return
 		}
 
 		callURL := fmt.Sprintf("https://%s/outbound-call-twiml?prompt=%s&number=%s",
-			r.Host, url.QueryEscape(req.Prompt), url.QueryEscape(req.Number))
+			r.Host,
+			url.QueryEscape(req.Prompt),
+			url.QueryEscape(req.Number),
+		)
 
 		params := map[string]string{
 			"To":   req.Number,
@@ -317,9 +346,9 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 	})
 }
 
-// HandleOutboundCallTwiml generates TwiML instructions for Twilio when setting up outbound calls.
 func HandleOutboundCallTwiml() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prompt := r.URL.Query().Get("prompt")
 		number := r.URL.Query().Get("number")
 
 		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -327,27 +356,32 @@ func HandleOutboundCallTwiml() http.Handler {
     <Connect>
         <Stream url="wss://%s/media-stream">
             <Parameter name="caller_phone" value="%s" />
+            <Parameter name="prompt" value="%s" />
             <Parameter name="direction" value="outbound" />
         </Stream>
     </Connect>
-</Response>`, r.Host, number)
+</Response>`,
+			r.Host,
+			number,
+			url.QueryEscape(prompt),
+		)
 
 		w.Header().Set("Content-Type", "text/xml")
 		_, _ = w.Write([]byte(twiml))
 	})
 }
 
-// ---- ElevenLabs message handling ----
+// -----------------------------------------------------------------------------
+// ElevenLabs → Twilio bridge (with PCM16 -> µ-law 8k transcoding)
+// -----------------------------------------------------------------------------
 
-// handleElevenLabsMessages reads from ElevenLabs ConvAI WS and forwards audio to Twilio.
 func handleElevenLabsMessages(
-	elevenLabsWs *websocket.Conn,
-	twilioWs *websocket.Conn,
+	elevenConn, twilioConn *websocket.Conn,
 	conversation *ConversationData,
 	disconnectFunc func(),
 ) {
 	for {
-		_, message, err := elevenLabsWs.ReadMessage()
+		_, message, err := elevenConn.ReadMessage()
 		if err != nil {
 			log.Printf("[ElevenLabs] WebSocket error: %v", err)
 			disconnectFunc()
@@ -361,89 +395,166 @@ func handleElevenLabsMessages(
 		}
 
 		msgType, _ := data["type"].(string)
+		if msgType == "" {
+			continue
+		}
 		log.Printf("[ElevenLabs] Received message type: %s", msgType)
 
 		switch msgType {
 		case "conversation_initiation_metadata":
 			if meta, ok := data["conversation_initiation_metadata_event"].(map[string]interface{}); ok {
-				if convID, ok := meta["conversation_id"].(string); ok {
-					conversation.ConversationID = convID
+				if id, ok := meta["conversation_id"].(string); ok {
+					conversation.ConversationID = id
 					conversations.Store(conversation.StreamSid, conversation)
-					log.Printf("[ElevenLabs] Stored conversation ID: %s", convID)
+					log.Printf("[ElevenLabs] Stored conversation ID: %s", id)
 				}
 			}
 
 		case "audio":
-			var audioBase64 string
+			var audioB64 string
 
-			if audioEvent, ok := data["audio_event"].(map[string]interface{}); ok {
-				if chunk, ok := audioEvent["audio_base_64"].(string); ok {
-					audioBase64 = chunk
-				}
+			if ev, ok := data["audio_event"].(map[string]interface{}); ok {
+				audioB64, _ = ev["audio_base_64"].(string)
 			} else if audio, ok := data["audio"].(map[string]interface{}); ok {
-				if chunk, ok := audio["chunk"].(string); ok {
-					audioBase64 = chunk
-				}
+				// older / alternative naming
+				audioB64, _ = audio["chunk"].(string)
 			}
 
-			if audioBase64 != "" && conversation.StreamSid != "" {
-				audioData := map[string]interface{}{
-					"event":     "media",
-					"streamSid": conversation.StreamSid,
-					"media": map[string]string{
-						"payload": audioBase64,
-					},
-				}
+			if audioB64 == "" {
+				continue
+			}
 
-				if err := twilioWs.WriteJSON(audioData); err != nil {
-					log.Printf("[Twilio] Error sending audio to Twilio: %v", err)
-				}
+			// Decode ElevenLabs PCM16 16k
+			pcmBytes, err := base64.StdEncoding.DecodeString(audioB64)
+			if err != nil {
+				log.Printf("[ElevenLabs] Error decoding audio base64: %v", err)
+				continue
+			}
+
+			ulawB64, err := pcm16ToULaw8kBase64(pcmBytes)
+			if err != nil {
+				log.Printf("[Transcode] Error transcoding ElevenLabs audio: %v", err)
+				continue
+			}
+
+			resp := map[string]interface{}{
+				"event":     "media",
+				"streamSid": conversation.StreamSid,
+				"media": map[string]string{
+					"payload": ulawB64,
+				},
+			}
+
+			if err := twilioConn.WriteJSON(resp); err != nil {
+				log.Printf("[Twilio] Error sending media: %v", err)
+			}
+
+		case "interruption":
+			clearMsg := map[string]interface{}{
+				"event":     "clear",
+				"streamSid": conversation.StreamSid,
+			}
+			if err := twilioConn.WriteJSON(clearMsg); err != nil {
+				log.Printf("[Twilio] Error sending clear: %v", err)
 			}
 
 		case "ping":
-			if pingEvent, ok := data["ping_event"].(map[string]interface{}); ok {
-				if eventID, ok := pingEvent["event_id"].(string); ok {
+			if ev, ok := data["ping_event"].(map[string]interface{}); ok {
+				if id, ok := ev["event_id"].(string); ok {
 					pong := map[string]interface{}{
 						"type":     "pong",
-						"event_id": eventID,
+						"event_id": id,
 					}
-					if err := elevenLabsWs.WriteJSON(pong); err != nil {
+					if err := elevenConn.WriteJSON(pong); err != nil {
 						log.Printf("[ElevenLabs] Error sending pong: %v", err)
 					}
 				}
 			}
 
 		case "end_of_conversation":
-			log.Println("[ElevenLabs] End of conversation received")
+			log.Println("[ElevenLabs] End of conversation")
 			disconnectFunc()
 			return
-
-		default:
-			// ignore other types
 		}
 	}
 }
 
-// ---- Twilio helper ----
+// -----------------------------------------------------------------------------
+// AUDIO TRANSCODING HELPERS (PCM16 16k -> µ-law 8k)
+// -----------------------------------------------------------------------------
 
-// createTwilioCall sends API request to Twilio to initiate an outbound call.
-func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
-	client := &http.Client{}
-
-	form := url.Values{}
-	for key, value := range params {
-		form.Add(key, value)
+// pcm16ToULaw8kBase64 takes raw little-endian PCM16 at 16kHz and returns base64 µ-law at 8kHz
+func pcm16ToULaw8kBase64(pcm []byte) (string, error) {
+	if len(pcm)%2 != 0 {
+		pcm = pcm[:len(pcm)-1]
+	}
+	samples := make([]int16, len(pcm)/2)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
 	}
 
-	req, err := http.NewRequest("POST",
+	// downsample 16k -> 8k by taking every 2nd sample (simple but fine for phone)
+	down := make([]int16, len(samples)/2)
+	for i := range down {
+		down[i] = samples[i*2]
+	}
+
+	ulaw := make([]byte, len(down))
+	for i, s := range down {
+		ulaw[i] = linearToMuLaw(s)
+	}
+
+	return base64.StdEncoding.EncodeToString(ulaw), nil
+}
+
+// standard G.711 µ-law encoder
+func linearToMuLaw(sample int16) byte {
+	const (
+		bias   = 0x84
+		clip   = 32635
+		signBit = 0x80
+	)
+
+	sign := byte(0)
+	if sample < 0 {
+		sample = -sample
+		sign = signBit
+	}
+	if sample > clip {
+		sample = clip
+	}
+	sample = sample + bias
+
+	// convert linear to µ-law
+	segment := 7
+	for v := sample >> 7; v != 0 && segment > 0; v >>= 1 {
+		segment--
+	}
+	mu := byte(((segment << 4) | ((sample >> (segment + 3)) & 0x0F)))
+	return ^(mu | sign)
+}
+
+// -----------------------------------------------------------------------------
+// TWILIO API + MOCK HELPERS
+// -----------------------------------------------------------------------------
+
+func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
+	client := &http.Client{}
+	form := url.Values{}
+	for k, v := range params {
+		form.Add(k, v)
+	}
+
+	req, err := http.NewRequest(
+		"POST",
 		fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json", accountSid),
-		strings.NewReader(form.Encode()))
+		strings.NewReader(form.Encode()),
+	)
 	if err != nil {
 		return nil, err
 	}
-
 	req.SetBasicAuth(accountSid, authToken)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -451,7 +562,7 @@ func createTwilioCall(params map[string]string, accountSid, authToken string) (m
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
 	}
 
@@ -459,6 +570,23 @@ func createTwilioCall(params map[string]string, accountSid, authToken string) (m
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
 	return result, nil
+}
+
+// For now these are mocked – they don’t affect audio path
+
+func checkUserExists(phone string) (map[string]interface{}, error) {
+	log.Printf("[Mock] Checking if user exists with phone: %s", phone)
+	return map[string]interface{}{
+		"first_name": "John",
+		"last_name":  "Doe",
+		"phone":      phone,
+	}, nil
+}
+
+func sendConversationWebhook(payload map[string]interface{}, endpoint string, authToken string) error {
+	log.Printf("[Mock Webhook] Sending payload to %s: %+v", endpoint, payload)
+	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
+	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
+	return nil
 }
