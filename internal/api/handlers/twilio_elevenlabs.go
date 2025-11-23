@@ -118,8 +118,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			isDisconnecting = false
 			mu              sync.Mutex
 
-			lastUserAudioTime  time.Time
-			outboundFirstName  string
+			lastUserAudioTime time.Time
 		)
 
 		disconnectCall := func() {
@@ -213,10 +212,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				if dir, ok := custom["direction"].(string); ok {
 					direction = dir
 				}
-				if fn, ok := custom["first_name"].(string); ok {
-					outboundFirstName = fn
-					log.Printf("[Twilio] Outbound first_name received: %s", outboundFirstName)
-				}
 
 				if userStr, ok := custom["user_data"].(string); ok && userStr != "" {
 					if decoded, err := url.QueryUnescape(userStr); err == nil {
@@ -252,7 +247,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				log.Println("[ElevenLabs] WebSocket connected")
 
 				isInbound := direction == "inbound"
-				configMsg := elevenlabs.GenerateElevenLabsConfig(userData, callerPhone, isInbound, outboundFirstName)
+				configMsg := elevenlabs.GenerateElevenLabsConfig(userData, callerPhone, isInbound)
 
 				if err := elevenConn.WriteJSON(configMsg); err != nil {
 					log.Printf("[ElevenLabs] Error sending config: %v", err)
@@ -332,12 +327,19 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
+		// Build user_data JSON for outbound calls (e.g. first_name from Carrd/Make)
+		userData := map[string]interface{}{}
+		if req.FirstName != "" {
+			userData["first_name"] = req.FirstName
+		}
+		userDataJSON, _ := json.Marshal(userData)
+
 		callURL := fmt.Sprintf(
-			"https://%s/outbound-call-twiml?prompt=%s&number=%s&first_name=%s",
+			"https://%s/outbound-call-twiml?prompt=%s&number=%s&user_data=%s",
 			r.Host,
 			url.QueryEscape(req.Prompt),
 			url.QueryEscape(req.Number),
-			url.QueryEscape(req.FirstName),
+			url.QueryEscape(string(userDataJSON)),
 		)
 
 		params := map[string]string{
@@ -366,7 +368,7 @@ func HandleOutboundCallTwiml() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prompt := r.URL.Query().Get("prompt")
 		number := r.URL.Query().Get("number")
-		firstName := r.URL.Query().Get("first_name")
+		userDataStr := r.URL.Query().Get("user_data")
 
 		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -374,7 +376,7 @@ func HandleOutboundCallTwiml() http.Handler {
         <Stream url="wss://%s/media-stream">
             <Parameter name="caller_phone" value="%s" />
             <Parameter name="prompt" value="%s" />
-            <Parameter name="first_name" value="%s" />
+            <Parameter name="user_data" value="%s" />
             <Parameter name="direction" value="outbound" />
         </Stream>
     </Connect>
@@ -382,7 +384,7 @@ func HandleOutboundCallTwiml() http.Handler {
 			r.Host,
 			number,
 			url.QueryEscape(prompt),
-			url.QueryEscape(firstName),
+			url.QueryEscape(userDataStr),
 		)
 
 		w.Header().Set("Content-Type", "text/xml")
