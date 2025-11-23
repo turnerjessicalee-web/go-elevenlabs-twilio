@@ -328,18 +328,36 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
-		// Pass number + name + email into the TwiML endpoint
+		normalizedNumber := normalizeAUNumber(req.Number)
+		if normalizedNumber == "" {
+			http.Error(w, "Invalid phone number", http.StatusBadRequest)
+			return
+		}
+
+		// Build a small user data blob for outbound calls so ElevenLabs gets name/email
+		userData := map[string]interface{}{}
+		if req.FirstName != "" {
+			userData["first_name"] = req.FirstName
+		}
+		if req.Email != "" {
+			userData["email"] = req.Email
+		}
+		userDataJSON, _ := json.Marshal(userData)
+		escapedUserData := url.QueryEscape(string(userDataJSON))
+
+		// Pass normalized number + name + email into the TwiML endpoint
 		callURL := fmt.Sprintf(
-			"https://%s/outbound-call-twiml?number=%s&first_name=%s&email=%s&prompt=%s",
+			"https://%s/outbound-call-twiml?number=%s&first_name=%s&email=%s&prompt=%s&user_data=%s",
 			r.Host,
-			url.QueryEscape(req.Number),
+			url.QueryEscape(normalizedNumber),
 			url.QueryEscape(req.FirstName),
 			url.QueryEscape(req.Email),
 			url.QueryEscape(req.Prompt),
+			escapedUserData,
 		)
 
 		params := map[string]string{
-			"To":   req.Number,
+			"To":   normalizedNumber,
 			"From": cfg.TwilioPhoneNumber,
 			"Url":  callURL,
 		}
@@ -363,20 +381,25 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 func HandleOutboundCallTwiml() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prompt := r.URL.Query().Get("prompt")
-		number := r.URL.Query().Get("number")
+		number := r.URL.Query().Get("number") // already normalized
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
+		userDataStr := r.URL.Query().Get("user_data")
 
-		// Build user_data JSON from query params
-		userData := map[string]interface{}{}
-		if firstName != "" {
-			userData["first_name"] = firstName
+		// If user_data came in, just pass it straight through to the stream as user_data
+		userDataValue := userDataStr
+		if userDataValue == "" {
+			// fallback: rebuild minimal structure
+			userData := map[string]interface{}{}
+			if firstName != "" {
+				userData["first_name"] = firstName
+			}
+			if email != "" {
+				userData["email"] = email
+			}
+			b, _ := json.Marshal(userData)
+			userDataValue = url.QueryEscape(string(b))
 		}
-		if email != "" {
-			userData["email"] = email
-		}
-		userDataJSON, _ := json.Marshal(userData)
-		escapedUserData := url.QueryEscape(string(userDataJSON))
 
 		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -391,7 +414,7 @@ func HandleOutboundCallTwiml() http.Handler {
 </Response>`,
 			r.Host,
 			number,
-			escapedUserData,
+			userDataValue,
 			url.QueryEscape(prompt),
 		)
 
@@ -577,6 +600,75 @@ func linearToMuLaw(sample int16) byte {
 	mu := byte(sign | (exponent << 4) | mantissa)
 
 	return ^mu
+}
+
+// -----------------------------------------------------------------------------
+// PHONE NORMALISATION (AU -> +61...)
+// -----------------------------------------------------------------------------
+
+func normalizeAUNumber(input string) string {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return ""
+	}
+
+	// Remove common formatting
+	replacer := strings.NewReplacer(" ", "", "-", "", "(", "", ")", "")
+	raw = replacer.Replace(raw)
+
+	if raw == "" {
+		return ""
+	}
+
+	// Already in + format
+	if strings.HasPrefix(raw, "+") {
+		if strings.HasPrefix(raw, "+61") {
+			rest := raw[3:]
+			if strings.HasPrefix(rest, "0") {
+				rest = rest[1:]
+			}
+			return "+61" + rest
+		}
+		return raw
+	}
+
+	// 00 international prefix
+	if strings.HasPrefix(raw, "00") {
+		tmp := raw[2:]
+		if strings.HasPrefix(tmp, "61") {
+			tmp = tmp[2:]
+			if strings.HasPrefix(tmp, "0") {
+				tmp = tmp[1:]
+			}
+			return "+61" + tmp
+		}
+		return "+" + tmp
+	}
+
+	// Assume AU local formats from here
+
+	// Mobile: 04xxxxxxxx
+	if len(raw) == 10 && strings.HasPrefix(raw, "04") {
+		return "+61" + raw[1:]
+	}
+
+	// Mobile without leading 0: 4xxxxxxxx
+	if len(raw) == 9 && strings.HasPrefix(raw, "4") {
+		return "+61" + raw
+	}
+
+	// Landline: 0[2,3,7,8]xxxxxxx
+	if len(raw) == 10 && raw[0] == '0' && strings.ContainsRune("2378", rune(raw[1])) {
+		return "+61" + raw[1:]
+	}
+
+	// 13 / 1300 / 1800 / 180x etc
+	if raw[0] == '1' {
+		return "+61" + raw
+	}
+
+	// Fallback: just prepend +61
+	return "+61" + raw
 }
 
 // -----------------------------------------------------------------------------
