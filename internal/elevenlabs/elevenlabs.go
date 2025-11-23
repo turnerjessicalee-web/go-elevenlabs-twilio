@@ -50,22 +50,52 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		}
 	}
 
-	fullName := fmt.Sprintf("%s %s", firstName, lastName)
+	fullName := firstName
+	if lastName != "" {
+		if fullName != "" {
+			fullName = fmt.Sprintf("%s %s", firstName, lastName)
+		} else {
+			fullName = lastName
+		}
+	}
 
 	agentCfg := cfg["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
 
+	// -----------------------------
+	// Prompt (general behaviour)
+	// -----------------------------
 	var prompt string
 	if isInbound {
 		prompt, _ = generateInboundCallPrompt(fullName)
 	} else {
 		prompt, _ = generateOutboundCallPrompt(fullName)
 	}
-
 	agentCfg["prompt"] = map[string]interface{}{
 		"prompt": prompt,
 	}
 
-	// Pass client data if available
+	// -----------------------------
+	// FIRST MESSAGE OVERRIDE
+	// -----------------------------
+	// ElevenLabs has a dedicated "first_message" field that controls what it says first.
+	// We override that here for OUTBOUND demo calls so it ALWAYS uses your scripted intro.
+	if !isInbound {
+		introName := firstName
+		if introName == "" {
+			introName = "there"
+		}
+
+		agentCfg["first_message"] = fmt.Sprintf(
+			"Hi %s, it’s Bellkeeper, your virtual receptionist. "+
+				"This is a quick live demo so you can experience how I can handle guest bookings. "+
+				"When you’re ready, just say: 'I’d like to make a booking.'",
+			introName,
+		)
+	}
+
+	// -----------------------------
+	// Client data / dynamic vars
+	// -----------------------------
 	if userData != nil {
 		dynamicVars := map[string]string{
 			"caller_phone": callerPhone,
@@ -87,15 +117,15 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 func generateInboundCallPrompt(name string) (string, error) {
 	prompt := `
 You are Bellkeeper, an AI-powered virtual receptionist for motels.
-The caller's name is %s.
 
-Your job on INBOUND calls is to warmly greet the caller, understand whether they want to:
+If the caller's name is provided, their name is %s. Use it once near the start of the call, but not in every sentence.
+
+Your job on INBOUND calls is to warmly greet the caller and quickly understand whether they want to:
 - make a new booking
 - change or cancel an existing booking
 - ask a simple question
 
 Speak clearly and naturally, like a friendly human receptionist on a phone line.
-Use the caller's name once near the start, but not in every sentence.
 Ask short, direct questions and pause to let them reply. Do not talk over them.
 `
 	return fmt.Sprintf(prompt, name), nil
@@ -105,18 +135,16 @@ func generateOutboundCallPrompt(name string) (string, error) {
 	prompt := `
 You are Bellkeeper, an AI-powered virtual receptionist for motels.
 You are calling a motel owner or manager for a live demo.
-Their name is %s.
 
-Your VERY FIRST spoken message to them MUST be exactly:
+If their name is provided, their name is %s.
 
-"Hi %s, it’s Bellkeeper, your virtual receptionist. This is a quick live demo so you can experience how I can handle guest bookings. When you’re ready, just say: 'I’d like to make a booking.'"
-
-After that first message, stop speaking and wait for their response.
-Do not speak over the top of them.
-Keep all further responses short, warm and practical, like a professional front-desk host.
+After your FIRST MESSAGE (which is separately configured), you should:
+- keep responses short, warm and practical
+- focus on helping them experience how you would handle a guest booking
+- not speak over the top of them
+- ask clear, simple questions to move the booking forward
 `
-	// We want the name to appear twice in the scripted first line: once in the sentence and once in the explicit quote.
-	return fmt.Sprintf(prompt, name, name), nil
+	return fmt.Sprintf(prompt, name), nil
 }
 
 // helper to safely JSON encode into string
