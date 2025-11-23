@@ -49,14 +49,9 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 }
 
 // GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
-// NOTE:
-//   - input_audio_format  = "mulaw_8000"  (we send Twilio μ-law 8k directly)
-//   - output_audio_format = "pcm_16000"   (we convert this back to μ-law 8k before sending to Twilio)
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
 	config := map[string]interface{}{
-		"type":                "conversation_initiation_client_data",
-		"input_audio_format":  "mulaw_8000",
-		"output_audio_format": "pcm_16000",
+		"type": "conversation_initiation_client_data",
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
 		},
@@ -79,17 +74,21 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 
 	agentConfig := config["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
 
-	// Set prompt based on call direction
+	// Set prompt and first message based on call direction
 	if isInbound {
 		inboundPrompt, _ := generateInboundCallPrompt(fullName)
+
 		agentConfig["prompt"] = map[string]interface{}{
 			"prompt": inboundPrompt,
 		}
+		agentConfig["first_message"] = fmt.Sprintf("Hi %s! I'm a supportive AI Agent. Do you have a moment to talk?", firstName)
 	} else {
 		outboundPrompt, _ := generateOutboundCallPrompt(fullName)
+
 		agentConfig["prompt"] = map[string]interface{}{
 			"prompt": outboundPrompt,
 		}
+		agentConfig["first_message"] = fmt.Sprintf("Hi %s! A supportive AI Agent is here to help you. What do you want to talk about?", firstName)
 	}
 
 	// add dynamic variables if user data is available
@@ -108,7 +107,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 func generateInboundCallPrompt(name string) (string, error) {
 	prompt := `
 You are an AI Agent that is supportive and helpful.
-Your main task is to motivate the interlocutor whose name is %s to enjoy their life.
+You main task it to motivate the interlocutor who's name is %s to enjoy their life.
 `
 	return fmt.Sprintf(prompt, name), nil
 }
@@ -116,7 +115,7 @@ Your main task is to motivate the interlocutor whose name is %s to enjoy their l
 func generateOutboundCallPrompt(name string) (string, error) {
 	prompt := `
 You are an AI Agent that is supportive and helpful.
-Your main task is to motivate the interlocutor whose name is %s to enjoy their life.
+You main task it to motivate the interlocutor who's name is %s to enjoy their life.
 `
 	return fmt.Sprintf(prompt, name), nil
 }
