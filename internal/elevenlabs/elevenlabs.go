@@ -8,7 +8,9 @@ import (
 	"net/http"
 )
 
-// GetSignedElevenLabsURL retrieves a signed WebSocket URL from ElevenLabs
+// GetSignedElevenLabsURL retrieves a signed WebSocket URL from ElevenLabs.
+// This is still fine to use if your backend is calling the
+// /v1/convai/conversation/get_signed_url endpoint with an agent_id.
 func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 	url := fmt.Sprintf("https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=%s", agentID)
 
@@ -48,15 +50,17 @@ func GetSignedElevenLabsURL(agentID string, apiKey string) (string, error) {
 	return result.SignedURL, nil
 }
 
-// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation
+// GenerateElevenLabsConfig creates configuration for initializing ElevenLabs conversation.
+// IMPORTANT: Twilio uses G.711 μ-law. ElevenLabs ConvAI must be told "g711_ulaw"
+// for both input and output, otherwise you hear static.
 func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone string, isInbound bool) map[string]interface{} {
 	config := map[string]interface{}{
-		"type": "conversation_initiation_client_data",
-		// NOTE: ConvAI will decide exact formats; Twilio path is mulaw.
-		// If your agent is configured for mulaw_8000 this will match;
-		// otherwise ElevenLabs will resample internally from our mulaw input.
-		"input_audio_format":  "mulaw_8000",
-		"output_audio_format": "mulaw_8000",
+		"type":               "conversation_initiation_client_data",
+		"input_audio_format": "g711_ulaw", // <-- key change
+		"output_audio_format": "g711_ulaw", // <-- key change
+
+		// We override the agent config mainly to inject a prompt.
+		// Your agent_id is supplied via the signed URL.
 		"conversation_config_override": map[string]interface{}{
 			"agent": map[string]interface{}{},
 		},
@@ -65,6 +69,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 	var firstName, lastName string
 
 	if userData != nil {
+		// Adapted from your existing shape: userData["debtor"]["first_name"] etc.
 		if debtor, ok := userData["debtor"].(map[string]interface{}); ok {
 			if fn, ok := debtor["first_name"].(string); ok {
 				firstName = fn
@@ -73,6 +78,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 				lastName = ln
 			}
 		} else {
+			// Fallback for simpler shapes like {"first_name": "...", "last_name": "..."}
 			if fn, ok := userData["first_name"].(string); ok {
 				firstName = fn
 			}
@@ -86,6 +92,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 
 	agentConfig := config["conversation_config_override"].(map[string]interface{})["agent"].(map[string]interface{})
 
+	// Set prompt based on call direction
 	if isInbound {
 		inboundPrompt, _ := generateInboundCallPrompt(fullName)
 		agentConfig["prompt"] = map[string]interface{}{
@@ -98,6 +105,7 @@ func GenerateElevenLabsConfig(userData map[string]interface{}, callerPhone strin
 		}
 	}
 
+	// Add dynamic variables if user data is available
 	if userData != nil {
 		config["client_data"] = map[string]interface{}{
 			"dynamic_variables": map[string]string{
