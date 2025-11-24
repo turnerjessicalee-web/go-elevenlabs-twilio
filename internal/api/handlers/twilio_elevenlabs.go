@@ -41,16 +41,23 @@ type ConversationData struct {
 	Direction      string // "inbound" or "outbound"
 }
 
+// NumberStats tracks per-number usage per day
+type NumberStats struct {
+	Count int
+	Date  string // YYYY-MM-DD
+}
+
 var (
 	conversations sync.Map
 
-	// Guardrails: per-number cooldown + daily cap
-	lastCallByNumberMu sync.Mutex
-	lastCallByNumber   = make(map[string]time.Time)
-
+	// Guardrails: global daily cap
 	dailyCallCountMu sync.Mutex
 	dailyCallCount   int
 	dailyCallDate    = time.Now().Format("2006-01-02")
+
+	// Guardrails: per-number daily cap (max 4 calls / number / day)
+	numberStatsMu sync.Mutex
+	numberStats   = make(map[string]NumberStats)
 )
 
 // -----------------------------------------------------------------------------
@@ -316,7 +323,15 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					}
 				}()
 
-				go handleElevenLabsMessages(elevenConn, twilioConn, conversation, disconnectCall, &lastUserAudioTime, &mu, &isDisconnecting)
+				go handleElevenLabsMessages(
+					elevenConn,
+					twilioConn,
+					conversation,
+					disconnectCall,
+					&lastUserAudioTime,
+					&mu,
+					&isDisconnecting,
+				)
 
 			case "media":
 				media, ok := data["media"].(map[string]interface{})
@@ -406,14 +421,15 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
-		// Daily cap with simple reset
 		today := time.Now().Format("2006-01-02")
+
+		// Global daily cap with simple reset
 		dailyCallCountMu.Lock()
 		if today != dailyCallDate {
 			dailyCallDate = today
 			dailyCallCount = 0
 		}
-		if dailyCallCount >= 50 { // TODO: make configurable via env if needed
+		if dailyCallCount >= 50 { // global cap (tweak as needed)
 			dailyCallCountMu.Unlock()
 			log.Printf("[Guard] Daily call cap reached (%d). Blocking auto-call.", dailyCallCount)
 			http.Error(w, "Daily call limit reached. Your request has been recorded for manual review.", http.StatusTooManyRequests)
@@ -421,21 +437,19 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 		}
 		dailyCallCountMu.Unlock()
 
-		// Per-number cooldown (e.g. 30 minutes)
-		cooldown := 30 * time.Minute
-		now := time.Now()
-
-		lastCallByNumberMu.Lock()
-		if last, ok := lastCallByNumber[normalizedNumber]; ok {
-			if now.Sub(last) < cooldown {
-				lastCallByNumberMu.Unlock()
-				log.Printf("[Guard] Cooldown: recently called %s at %s", normalizedNumber, last.Format(time.RFC3339))
-				http.Error(w, "We recently called this number. Please try again later.", http.StatusTooManyRequests)
-				return
-			}
+		// Per-number cap: max 4 calls per number per day
+		numberStatsMu.Lock()
+		ns, ok := numberStats[normalizedNumber]
+		if !ok || ns.Date != today {
+			ns = NumberStats{Count: 0, Date: today}
 		}
-		lastCallByNumber[normalizedNumber] = now
-		lastCallByNumberMu.Unlock()
+		if ns.Count >= 4 {
+			numberStatsMu.Unlock()
+			log.Printf("[Guard] Per-number cap reached for %s: %d calls today", normalizedNumber, ns.Count)
+			http.Error(w, "We have already called this number several times today. Please try again tomorrow.", http.StatusTooManyRequests)
+			return
+		}
+		numberStatsMu.Unlock()
 
 		// Build TwiML URL (no user_data in query; we build it in the TwiML handler)
 		callURL := fmt.Sprintf(
@@ -460,10 +474,21 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
-		// Increment daily call count only on successful Twilio call creation
+		// Increment global daily call count only on successful Twilio call creation
 		dailyCallCountMu.Lock()
 		dailyCallCount++
 		dailyCallCountMu.Unlock()
+
+		// Increment per-number count (now that the call was actually created)
+		numberStatsMu.Lock()
+		ns, ok = numberStats[normalizedNumber]
+		if !ok || ns.Date != today {
+			ns = NumberStats{Count: 0, Date: today}
+		}
+		ns.Count++
+		ns.Date = today
+		numberStats[normalizedNumber] = ns
+		numberStatsMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -481,360 +506,4 @@ func HandleOutboundCallTwiml() http.Handler {
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
 
-		// Build user_data JSON from query params (so ElevenLabs can see name/email)
-		userData := map[string]interface{}{}
-		if firstName != "" {
-			userData["first_name"] = firstName
-		}
-		if email != "" {
-			userData["email"] = email
-		}
-		userDataJSON, _ := json.Marshal(userData)
-		escapedUserData := url.QueryEscape(string(userDataJSON))
-
-		twiml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <Stream url="wss://%s/media-stream">
-            <Parameter name="caller_phone" value="%s" />
-            <Parameter name="user_data" value="%s" />
-            <Parameter name="prompt" value="%s" />
-            <Parameter name="direction" value="outbound" />
-        </Stream>
-    </Connect>
-</Response>`,
-			r.Host,
-			number,
-			escapedUserData,
-			url.QueryEscape(prompt),
-		)
-
-		w.Header().Set("Content-Type", "text/xml")
-		_, _ = w.Write([]byte(twiml))
-	})
-}
-
-// -----------------------------------------------------------------------------
-// ElevenLabs → Twilio bridge (with PCM16 -> µ-law 8k)
-// -----------------------------------------------------------------------------
-
-func handleElevenLabsMessages(
-	elevenConn, twilioConn *websocket.Conn,
-	conversation *ConversationData,
-	disconnectFunc func(),
-	lastUserAudioTime *time.Time,
-	mu *sync.Mutex,
-	isDisconnecting *bool,
-) {
-	for {
-		_, message, err := elevenConn.ReadMessage()
-		if err != nil {
-			log.Printf("[ElevenLabs] WebSocket error: %v", err)
-			disconnectFunc()
-			return
-		}
-
-		now := time.Now()
-
-		var data map[string]interface{}
-		if err := json.Unmarshal(message, &data); err != nil {
-			log.Printf("[ElevenLabs] Error parsing message: %v", err)
-			continue
-		}
-
-		msgType, _ := data["type"].(string)
-		if msgType == "" {
-			continue
-		}
-		log.Printf("[ElevenLabs] Received message type: %s", msgType)
-
-		mu.Lock()
-		localDisconnecting := *isDisconnecting
-		mu.Unlock()
-		if localDisconnecting {
-			return
-		}
-
-		switch msgType {
-		case "conversation_initiation_metadata":
-			if meta, ok := data["conversation_initiation_metadata_event"].(map[string]interface{}); ok {
-				if id, ok := meta["conversation_id"].(string); ok {
-					conversation.ConversationID = id
-					conversations.Store(conversation.StreamSid, conversation)
-					log.Printf("[ElevenLabs] Stored conversation ID: %s", id)
-				}
-			}
-
-		case "audio":
-			var audioB64 string
-
-			if ev, ok := data["audio_event"].(map[string]interface{}); ok {
-				audioB64, _ = ev["audio_base_64"].(string)
-			} else if audio, ok := data["audio"].(map[string]interface{}); ok {
-				audioB64, _ = audio["chunk"].(string)
-			}
-
-			if audioB64 == "" {
-				continue
-			}
-
-			if EnableLatencyDebug {
-				mu.Lock()
-				lt := *lastUserAudioTime
-				mu.Unlock()
-
-				if !lt.IsZero() {
-					delta := now.Sub(lt)
-					log.Printf("[Latency] EL_IN audio at %s; time since last TWILIO_IN media: %s", now.Format(time.RFC3339Nano), delta.String())
-				} else {
-					log.Printf("[Latency] EL_IN audio at %s; no last TWILIO_IN timestamp recorded", now.Format(time.RFC3339Nano))
-				}
-			}
-
-			pcmBytes, err := base64.StdEncoding.DecodeString(audioB64)
-			if err != nil {
-				log.Printf("[ElevenLabs] Error decoding audio base64: %v", err)
-				continue
-			}
-
-			ulawB64, err := pcm16ToULaw8kBase64(pcmBytes)
-			if err != nil {
-				log.Printf("[Transcode] Error transcoding ElevenLabs audio: %v", err)
-				continue
-			}
-
-			resp := map[string]interface{}{
-				"event":     "media",
-				"streamSid": conversation.StreamSid,
-				"media": map[string]string{
-					"payload": ulawB64,
-				},
-			}
-
-			sendStart := time.Now()
-			if err := twilioConn.WriteJSON(resp); err != nil {
-				log.Printf("[Twilio] Error sending media: %v", err)
-			} else if EnableLatencyDebug {
-				log.Printf("[Latency] TWILIO_OUT media at %s (send duration: %s)", time.Now().Format(time.RFC3339Nano), time.Since(sendStart).String())
-			}
-
-		case "interruption":
-			clearMsg := map[string]interface{}{
-				"event":     "clear",
-				"streamSid": conversation.StreamSid,
-			}
-			if err := twilioConn.WriteJSON(clearMsg); err != nil {
-				log.Printf("[Twilio] Error sending clear: %v", err)
-			}
-
-		case "ping":
-			if ev, ok := data["ping_event"].(map[string]interface{}); ok {
-				if id, ok := ev["event_id"].(string); ok {
-					pong := map[string]interface{}{
-						"type":     "pong",
-						"event_id": id,
-					}
-					if err := elevenConn.WriteJSON(pong); err != nil {
-						log.Printf("[ElevenLabs] Error sending pong: %v", err)
-					}
-				}
-			}
-
-		case "end_of_conversation":
-			log.Println("[ElevenLabs] End of conversation")
-			disconnectFunc()
-			return
-		}
-	}
-}
-
-// -----------------------------------------------------------------------------
-// AUDIO TRANSCODING HELPERS (PCM16 16k -> µ-law 8k)
-// -----------------------------------------------------------------------------
-
-// pcm16ToULaw8kBase64 takes raw little-endian PCM16 at 16kHz and returns base64 µ-law at 8kHz
-func pcm16ToULaw8kBase64(pcm []byte) (string, error) {
-	if len(pcm)%2 != 0 {
-		pcm = pcm[:len(pcm)-1]
-	}
-	samples := make([]int16, len(pcm)/2)
-	for i := range samples {
-		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
-	}
-
-	down := make([]int16, len(samples)/2)
-	for i := range down {
-		down[i] = samples[i*2]
-	}
-
-	ulaw := make([]byte, len(down))
-	for i, s := range down {
-		ulaw[i] = linearToMuLaw(s)
-	}
-
-	return base64.StdEncoding.EncodeToString(ulaw), nil
-}
-
-// standard G.711 µ-law encoder (all int math, then cast to byte)
-func linearToMuLaw(sample int16) byte {
-	const (
-		bias = 0x84
-		clip = 32635
-	)
-
-	s := int(sample)
-
-	sign := 0
-	if s < 0 {
-		s = -s
-		sign = 0x80
-	}
-
-	if s > clip {
-		s = clip
-	}
-	s += bias
-
-	exponent := 7
-	for expMask := 0x4000; (s & expMask) == 0 && exponent > 0; exponent-- {
-		expMask >>= 1
-	}
-
-	mantissa := (s >> (exponent + 3)) & 0x0F
-	mu := byte(sign | (exponent << 4) | mantissa)
-
-	return ^mu
-}
-
-// -----------------------------------------------------------------------------
-// PHONE NORMALISATION (AU -> +61...)
-// -----------------------------------------------------------------------------
-
-func normalizeAUNumber(input string) string {
-	raw := strings.TrimSpace(input)
-	if raw == "" {
-		return ""
-	}
-
-	// Remove common formatting
-	replacer := strings.NewReplacer(" ", "", "-", "", "(", "", ")", "")
-	raw = replacer.Replace(raw)
-
-	if raw == "" {
-		return ""
-	}
-
-	// Already in + format
-	if strings.HasPrefix(raw, "+") {
-		if strings.HasPrefix(raw, "+61") {
-			rest := raw[3:]
-			if strings.HasPrefix(rest, "0") {
-				rest = rest[1:]
-			}
-			return "+61" + rest
-		}
-		return raw
-	}
-
-	// 00 international prefix
-	if strings.HasPrefix(raw, "00") {
-		tmp := raw[2:]
-		if strings.HasPrefix(tmp, "61") {
-			tmp = tmp[2:]
-			if strings.HasPrefix(tmp, "0") {
-				tmp = tmp[1:]
-			}
-			return "+61" + tmp
-		}
-		return "+" + tmp
-	}
-
-	// Assume AU local formats from here
-
-	// Mobile: 04xxxxxxxx
-	if len(raw) == 10 && strings.HasPrefix(raw, "04") {
-		return "+61" + raw[1:]
-	}
-
-	// Mobile without leading 0: 4xxxxxxxx
-	if len(raw) == 9 && strings.HasPrefix(raw, "4") {
-		return "+61" + raw
-	}
-
-	// Landline: 0[2,3,7,8]xxxxxxx
-	if len(raw) == 10 && raw[0] == '0' && strings.ContainsRune("2378", rune(raw[1])) {
-		return "+61" + raw[1:]
-	}
-
-	// 13 / 1300 / 1800 / 180x etc
-	if raw[0] == '1' {
-		return "+61" + raw
-	}
-
-	// Fallback: only accept if it looks plausibly long enough for AU
-	if len(raw) < 8 {
-		// Too short to be a real AU number
-		return ""
-	}
-	if raw[0] == '0' || raw[0] == '4' || raw[0] == '1' {
-		return "+61" + raw
-	}
-
-	// Otherwise reject instead of guessing
-	return ""
-}
-
-// -----------------------------------------------------------------------------
-// TWILIO API + MOCK HELPERS
-// -----------------------------------------------------------------------------
-
-func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
-	client := &http.Client{}
-	form := url.Values{}
-	for k, v := range params {
-		form.Add(k, v)
-	}
-
-	req, err := http.NewRequest(
-		"POST",
-		fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json", accountSid),
-		strings.NewReader(form.Encode()),
-	)
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth(accountSid, authToken)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func checkUserExists(phone string) (map[string]interface{}, error) {
-	log.Printf("[Mock] Checking if user exists with phone: %s", phone)
-	return map[string]interface{}{
-		"first_name": "John",
-		"last_name":  "Doe",
-		"phone":      phone,
-	}, nil
-}
-
-func sendConversationWebhook(payload map[string]interface{}, endpoint string, authToken string) error {
-	log.Printf("[Mock Webhook] Sending payload to %s: %+v", endpoint, payload)
-	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
-	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
-	return nil
-}
+		// Build user_data JSON from quer_
