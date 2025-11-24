@@ -41,7 +41,17 @@ type ConversationData struct {
 	Direction      string // "inbound" or "outbound"
 }
 
-var conversations sync.Map
+var (
+	conversations sync.Map
+
+	// Guardrails: per-number cooldown + daily cap
+	lastCallByNumberMu sync.Mutex
+	lastCallByNumber   = make(map[string]time.Time)
+
+	dailyCallCountMu sync.Mutex
+	dailyCallCount   int
+	dailyCallDate    = time.Now().Format("2006-01-02")
+)
 
 // -----------------------------------------------------------------------------
 // INBOUND CALL HANDLER
@@ -119,6 +129,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			mu              sync.Mutex
 
 			lastUserAudioTime time.Time
+			callStartTime     time.Time
 		)
 
 		disconnectCall := func() {
@@ -255,7 +266,57 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					continue
 				}
 
-				go handleElevenLabsMessages(elevenConn, twilioConn, conversation, disconnectCall, &lastUserAudioTime)
+				// Track call start + initial audio time for guardrails
+				mu.Lock()
+				callStartTime = time.Now()
+				lastUserAudioTime = callStartTime
+				mu.Unlock()
+
+				// Silence timeout watcher (e.g. 2 minutes of no user audio)
+				go func() {
+					ticker := time.NewTicker(30 * time.Second)
+					defer ticker.Stop()
+
+					for range ticker.C {
+						mu.Lock()
+						if isDisconnecting {
+							mu.Unlock()
+							return
+						}
+						lt := lastUserAudioTime
+						mu.Unlock()
+
+						if !lt.IsZero() && time.Since(lt) > 2*time.Minute {
+							log.Printf("[Guard] No user audio for >2m, disconnecting call (streamSid=%s)", streamSid)
+							disconnectCall()
+							return
+						}
+					}
+				}()
+
+				// Max call duration watcher (e.g. hard 5 min cap)
+				go func() {
+					ticker := time.NewTicker(30 * time.Second)
+					defer ticker.Stop()
+
+					for range ticker.C {
+						mu.Lock()
+						if isDisconnecting {
+							mu.Unlock()
+							return
+						}
+						cs := callStartTime
+						mu.Unlock()
+
+						if !cs.IsZero() && time.Since(cs) > 5*time.Minute {
+							log.Printf("[Guard] Call exceeded 5 minutes, disconnecting (streamSid=%s)", streamSid)
+							disconnectCall()
+							return
+						}
+					}
+				}()
+
+				go handleElevenLabsMessages(elevenConn, twilioConn, conversation, disconnectCall, &lastUserAudioTime, &mu, &isDisconnecting)
 
 			case "media":
 				media, ok := data["media"].(map[string]interface{})
@@ -267,9 +328,13 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					continue
 				}
 
+				now := time.Now()
+				mu.Lock()
+				lastUserAudioTime = now
+				mu.Unlock()
+
 				if EnableLatencyDebug {
-					lastUserAudioTime = time.Now()
-					log.Printf("[Latency] TWILIO_IN media at %s (len=%d bytes base64)", lastUserAudioTime.Format(time.RFC3339Nano), len(payload))
+					log.Printf("[Latency] TWILIO_IN media at %s (len=%d bytes base64)", now.Format(time.RFC3339Nano), len(payload))
 				}
 
 				if EchoMode {
@@ -334,6 +399,44 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
+		// 🚫 Block non-AU numbers for auto-calls
+		if !strings.HasPrefix(normalizedNumber, "+61") {
+			log.Printf("[Guard] Blocked non-AU number from auto-call: raw=%s normalized=%s", req.Number, normalizedNumber)
+			http.Error(w, "Only Australian numbers are auto-called. Your request has been recorded for manual review.", http.StatusBadRequest)
+			return
+		}
+
+		// Daily cap with simple reset
+		today := time.Now().Format("2006-01-02")
+		dailyCallCountMu.Lock()
+		if today != dailyCallDate {
+			dailyCallDate = today
+			dailyCallCount = 0
+		}
+		if dailyCallCount >= 50 { // TODO: make configurable via env if needed
+			dailyCallCountMu.Unlock()
+			log.Printf("[Guard] Daily call cap reached (%d). Blocking auto-call.", dailyCallCount)
+			http.Error(w, "Daily call limit reached. Your request has been recorded for manual review.", http.StatusTooManyRequests)
+			return
+		}
+		dailyCallCountMu.Unlock()
+
+		// Per-number cooldown (e.g. 30 minutes)
+		cooldown := 30 * time.Minute
+		now := time.Now()
+
+		lastCallByNumberMu.Lock()
+		if last, ok := lastCallByNumber[normalizedNumber]; ok {
+			if now.Sub(last) < cooldown {
+				lastCallByNumberMu.Unlock()
+				log.Printf("[Guard] Cooldown: recently called %s at %s", normalizedNumber, last.Format(time.RFC3339))
+				http.Error(w, "We recently called this number. Please try again later.", http.StatusTooManyRequests)
+				return
+			}
+		}
+		lastCallByNumber[normalizedNumber] = now
+		lastCallByNumberMu.Unlock()
+
 		// Build TwiML URL (no user_data in query; we build it in the TwiML handler)
 		callURL := fmt.Sprintf(
 			"https://%s/outbound-call-twiml?number=%s&first_name=%s&email=%s&prompt=%s",
@@ -356,6 +459,11 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			http.Error(w, "Failed to initiate call", http.StatusInternalServerError)
 			return
 		}
+
+		// Increment daily call count only on successful Twilio call creation
+		dailyCallCountMu.Lock()
+		dailyCallCount++
+		dailyCallCountMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -415,6 +523,8 @@ func handleElevenLabsMessages(
 	conversation *ConversationData,
 	disconnectFunc func(),
 	lastUserAudioTime *time.Time,
+	mu *sync.Mutex,
+	isDisconnecting *bool,
 ) {
 	for {
 		_, message, err := elevenConn.ReadMessage()
@@ -437,6 +547,13 @@ func handleElevenLabsMessages(
 			continue
 		}
 		log.Printf("[ElevenLabs] Received message type: %s", msgType)
+
+		mu.Lock()
+		localDisconnecting := *isDisconnecting
+		mu.Unlock()
+		if localDisconnecting {
+			return
+		}
 
 		switch msgType {
 		case "conversation_initiation_metadata":
@@ -462,8 +579,12 @@ func handleElevenLabsMessages(
 			}
 
 			if EnableLatencyDebug {
-				if lastUserAudioTime != nil && !lastUserAudioTime.IsZero() {
-					delta := now.Sub(*lastUserAudioTime)
+				mu.Lock()
+				lt := *lastUserAudioTime
+				mu.Unlock()
+
+				if !lt.IsZero() {
+					delta := now.Sub(lt)
 					log.Printf("[Latency] EL_IN audio at %s; time since last TWILIO_IN media: %s", now.Format(time.RFC3339Nano), delta.String())
 				} else {
 					log.Printf("[Latency] EL_IN audio at %s; no last TWILIO_IN timestamp recorded", now.Format(time.RFC3339Nano))
@@ -650,8 +771,17 @@ func normalizeAUNumber(input string) string {
 		return "+61" + raw
 	}
 
-	// Fallback: just prepend +61
-	return "+61" + raw
+	// Fallback: only accept if it looks plausibly long enough for AU
+	if len(raw) < 8 {
+		// Too short to be a real AU number
+		return ""
+	}
+	if raw[0] == '0' || raw[0] == '4' || raw[0] == '1' {
+		return "+61" + raw
+	}
+
+	// Otherwise reject instead of guessing
+	return ""
 }
 
 // -----------------------------------------------------------------------------
@@ -677,8 +807,10 @@ func createTwilioCall(params map[string]string, accountSid, authToken string) (m
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
-	respClose := resp.Body.Close
-	defer respClose()
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("twilio API error: %s", resp.Status)
