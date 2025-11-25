@@ -155,16 +155,17 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				_ = elevenConn.Close()
 			}
 
-			if conversation != nil && conversation.ConversationID != "" {
-				payload := map[string]interface{}{
-					"conversation_id": conversation.ConversationID,
-					"phone_number":    conversation.CallerPhone,
-					"call_sid":        conversation.CallSid,
-					"direction":       conversation.Direction,
-				}
-				_ = sendConversationWebhook(payload, conversation.Direction+"-calls", "123123")
-				conversations.Delete(streamSid)
-			}
+			    if conversation != nil && conversation.ConversationID != "" {
+		        payload := map[string]interface{}{
+		            "conversation_id": conversation.ConversationID,
+		            "phone_number":    conversation.CallerPhone,
+		            "call_sid":        conversation.CallSid,
+		            "direction":       conversation.Direction,
+		        }
+		        _ = sendConversationWebhook(cfg, payload)
+		        conversations.Delete(streamSid)
+		    }
+
 
 			msgs := []map[string]interface{}{
 				{"event": "mark_done", "streamSid": streamSid},
@@ -819,9 +820,38 @@ func checkUserExists(phone string) (map[string]interface{}, error) {
 	}, nil
 }
 
-func sendConversationWebhook(payload map[string]interface{}, endpoint string, authToken string) error {
-	log.Printf("[Mock Webhook] Sending payload to %s: %+v", endpoint, payload)
-	log.Printf("[Mock Webhook] Using auth token: %s", authToken)
-	log.Printf("[Mock Webhook] Successfully sent to %s endpoint", endpoint)
+func sendConversationWebhook(cfg *config.Config, payload map[string]interface{}) error {
+	if cfg.ConversationWebhookURL == "" {
+		log.Printf("[Webhook] ConversationWebhookURL not set; skipping webhook. Payload: %+v", payload)
+		return nil
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[Webhook] Error marshaling payload: %v", err)
+		return err
+	}
+
+	req, err := http.NewRequest("POST", cfg.ConversationWebhookURL, strings.NewReader(string(body)))
+	if err != nil {
+		log.Printf("[Webhook] Error creating request: %v", err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[Webhook] Error sending request: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[Webhook] Non-2xx status from Make: %s", resp.Status)
+		return fmt.Errorf("non-2xx status: %s", resp.Status)
+	}
+
+	log.Printf("[Webhook] Successfully sent conversation payload to Make. Status: %s", resp.Status)
 	return nil
 }
