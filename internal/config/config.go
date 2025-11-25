@@ -15,6 +15,9 @@ type Config struct {
 	ApiAuthToken      string
 	ApiURL            string
 	Environment       string
+
+	// 🔐 New: Shared secret for outbound-call protection
+	OutboundSecret string
 }
 
 func Load() (*Config, error) {
@@ -26,6 +29,9 @@ func Load() (*Config, error) {
 		TwilioAuthToken:   getEnv("TWILIO_AUTH_TOKEN", ""),
 		TwilioPhoneNumber: getEnv("TWILIO_PHONE_NUMBER", ""),
 		Environment:       getEnv("ENV", "development"),
+
+		// Load shared secret (optional)
+		OutboundSecret: getEnv("OUTBOUND_CALL_SECRET", ""),
 	}
 
 	// Validate required environment variables
@@ -35,6 +41,7 @@ func Load() (*Config, error) {
 
 	return cfg, nil
 }
+
 func (c *Config) validate() error {
 	required := map[string]string{
 		"ELEVENLABS_API_KEY":  c.ElevenLabsAPIKey,
@@ -50,6 +57,7 @@ func (c *Config) validate() error {
 		}
 	}
 
+	// OutboundSecret is *optional*, so no validation here
 	return nil
 }
 
