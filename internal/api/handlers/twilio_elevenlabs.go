@@ -155,17 +155,39 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				_ = elevenConn.Close()
 			}
 
-			    if conversation != nil && conversation.ConversationID != "" {
-		        payload := map[string]interface{}{
-		            "conversation_id": conversation.ConversationID,
-		            "phone_number":    conversation.CallerPhone,
-		            "call_sid":        conversation.CallSid,
-		            "direction":       conversation.Direction,
-		        }
-		        _ = sendConversationWebhook(cfg, payload)
-		        conversations.Delete(streamSid)
-		    }
+			// send webhook to Make with best phone identifier (raw_phone if present)
+			if conversation != nil && conversation.ConversationID != "" {
+				phone := conversation.CallerPhone
+				var email, firstName string
 
+				if conversation.UserData != nil {
+					if raw, ok := conversation.UserData["raw_phone"].(string); ok && raw != "" {
+						phone = raw
+					}
+					if e, ok := conversation.UserData["email"].(string); ok && e != "" {
+						email = e
+					}
+					if fn, ok := conversation.UserData["first_name"].(string); ok && fn != "" {
+						firstName = fn
+					}
+				}
+
+				payload := map[string]interface{}{
+					"conversation_id": conversation.ConversationID,
+					"phone_number":    phone,
+					"call_sid":        conversation.CallSid,
+					"direction":       conversation.Direction,
+				}
+				if email != "" {
+					payload["email"] = email
+				}
+				if firstName != "" {
+					payload["first_name"] = firstName
+				}
+
+				_ = sendConversationWebhook(cfg, payload)
+				conversations.Delete(streamSid)
+			}
 
 			msgs := []map[string]interface{}{
 				{"event": "mark_done", "streamSid": streamSid},
@@ -353,7 +375,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 
 func HandleOutboundCall(cfg *config.Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		
+
 		// 🔐 Shared-secret protection for outbound calls
 		clientSecret := r.Header.Get("X-Bellkeeper-Token")
 		if clientSecret == "" || clientSecret != cfg.OutboundSecret {
@@ -367,7 +389,6 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 			return
 		}
 
-		
 		var req struct {
 			Number    string `json:"number"`
 			FirstName string `json:"first_name"`
@@ -427,11 +448,12 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 		}
 		numberStatsMu.Unlock()
 
-		// Build TwiML URL (no user_data in query; we build it in the TwiML handler)
+		// Build TwiML URL (normalized number for Twilio, raw_number for matching in webhook/HubSpot)
 		callURL := fmt.Sprintf(
-			"https://%s/outbound-call-twiml?number=%s&first_name=%s&email=%s&prompt=%s",
+			"https://%s/outbound-call-twiml?number=%s&raw_number=%s&first_name=%s&email=%s&prompt=%s",
 			r.Host,
 			url.QueryEscape(normalizedNumber),
+			url.QueryEscape(req.Number), // raw Carrd value
 			url.QueryEscape(req.FirstName),
 			url.QueryEscape(req.Email),
 			url.QueryEscape(req.Prompt),
@@ -478,11 +500,12 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 func HandleOutboundCallTwiml() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prompt := r.URL.Query().Get("prompt")
-		number := r.URL.Query().Get("number") // already normalized
+		number := r.URL.Query().Get("number")      // normalized
+		rawNumber := r.URL.Query().Get("raw_number") // raw from Carrd
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
 
-		// Build user_data JSON from query params (so ElevenLabs can see name/email)
+		// Build user_data JSON from query params (so ElevenLabs + webhook can see name/email/raw_phone)
 		userData := map[string]interface{}{}
 		if firstName != "" {
 			userData["first_name"] = firstName
@@ -490,6 +513,10 @@ func HandleOutboundCallTwiml() http.Handler {
 		if email != "" {
 			userData["email"] = email
 		}
+		if rawNumber != "" {
+			userData["raw_phone"] = rawNumber
+		}
+
 		userDataJSON, _ := json.Marshal(userData)
 		escapedUserData := url.QueryEscape(string(userDataJSON))
 
@@ -650,6 +677,7 @@ func pcm16ToULaw8kBase64(pcm []byte) (string, error) {
 		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
 	}
 
+	// Downsample from 16kHz to 8kHz by taking every other sample
 	down := make([]int16, len(samples)/2)
 	for i := range down {
 		down[i] = samples[i*2]
