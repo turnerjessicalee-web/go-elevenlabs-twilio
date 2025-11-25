@@ -16,8 +16,11 @@ type Config struct {
 	ApiURL            string
 	Environment       string
 
-	// 🔐 New: Shared secret for outbound-call protection
+	// 🔐 Shared secret for outbound-call protection
 	OutboundSecret string
+	// ⏺️ convo log for CRM
+	ConversationWebhookURL  string 
+
 }
 
 func Load() (*Config, error) {
@@ -32,6 +35,7 @@ func Load() (*Config, error) {
 
 		// Load shared secret (optional)
 		OutboundSecret: getEnv("OUTBOUND_CALL_SECRET", ""),
+		ConversationWebhookURL: getEnv("CONVERSATION_WEBHOOK_URL", ""),
 	}
 
 	// Validate required environment variables
