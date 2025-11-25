@@ -502,7 +502,7 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 func HandleOutboundCallTwiml() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prompt := r.URL.Query().Get("prompt")
-		number := r.URL.Query().Get("number")       // normalized
+		number := r.URL.Query().Get("number")        // normalized
 		rawNumber := r.URL.Query().Get("raw_number") // raw from Carrd
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
@@ -657,11 +657,14 @@ func handleElevenLabsMessages(
 				}
 			}
 
-		case "transcript":
-			// NEW: accumulate transcript text if ElevenLabs sends it
-			if ev, ok := data["transcript_event"].(map[string]interface{}); ok {
-				if text, ok := ev["text"].(string); ok && text != "" {
-					conversation.Transcript += text + "\n"
+		case "user_transcript":
+			// Accumulate transcript text from ElevenLabs (user side)
+			if ev, ok := data["user_transcription_event"].(map[string]interface{}); ok {
+				if text, ok := ev["user_transcript"].(string); ok && text != "" {
+					if conversation.Transcript != "" {
+						conversation.Transcript += "\n"
+					}
+					conversation.Transcript += text
 					log.Printf("[Transcript] %s", text)
 				}
 			}
