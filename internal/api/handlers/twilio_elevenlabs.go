@@ -39,6 +39,7 @@ type ConversationData struct {
 	CallerPhone    string
 	UserData       map[string]interface{}
 	Direction      string // "inbound" or "outbound"
+	Transcript     string // accumulated transcript text
 }
 
 // NumberStats tracks per-number usage per day
@@ -177,6 +178,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					"phone_number":    phone,
 					"call_sid":        conversation.CallSid,
 					"direction":       conversation.Direction,
+					"transcript":      conversation.Transcript,
 				}
 				if email != "" {
 					payload["email"] = email
@@ -500,7 +502,7 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 func HandleOutboundCallTwiml() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prompt := r.URL.Query().Get("prompt")
-		number := r.URL.Query().Get("number")      // normalized
+		number := r.URL.Query().Get("number")       // normalized
 		rawNumber := r.URL.Query().Get("raw_number") // raw from Carrd
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
@@ -652,6 +654,15 @@ func handleElevenLabsMessages(
 					if err := elevenConn.WriteJSON(pong); err != nil {
 						log.Printf("[ElevenLabs] Error sending pong: %v", err)
 					}
+				}
+			}
+
+		case "transcript":
+			// NEW: accumulate transcript text if ElevenLabs sends it
+			if ev, ok := data["transcript_event"].(map[string]interface{}); ok {
+				if text, ok := ev["text"].(string); ok && text != "" {
+					conversation.Transcript += text + "\n"
+					log.Printf("[Transcript] %s", text)
 				}
 			}
 
