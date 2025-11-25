@@ -356,10 +356,16 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 		// 🔐 Shared-secret protection for outbound calls
 		clientSecret := r.Header.Get("X-Bellkeeper-Token")
 		if clientSecret == "" || clientSecret != cfg.OutboundSecret {
-			log.Printf("[Auth] Unauthorized outbound call attempt from %s", r.RemoteAddr)
+			log.Printf(
+				"[Auth] Unauthorized outbound call attempt from %s (received_header=%q, secret_set=%t)",
+				r.RemoteAddr,
+				clientSecret,
+				cfg.OutboundSecret != "",
+			)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+
 		
 		var req struct {
 			Number    string `json:"number"`
