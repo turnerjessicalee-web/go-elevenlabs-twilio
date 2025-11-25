@@ -252,7 +252,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				// MAX CALL DURATION (8 minutes)
 				// -----------------------------
 				go func(localStream string) {
-					timeout := 1 * time.Minute
+					timeout := 8 * time.Minute
 					log.Printf("[Guardrail] Max-duration timer started (%s) for stream %s", timeout, localStream)
 
 					<-time.After(timeout)
