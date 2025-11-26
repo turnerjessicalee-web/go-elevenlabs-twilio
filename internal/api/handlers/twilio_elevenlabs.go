@@ -266,6 +266,8 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					if decoded, err := url.QueryUnescape(userStr); err == nil {
 						if err := json.Unmarshal([]byte(decoded), &userData); err != nil {
 							log.Printf("[Twilio] Error parsing user_data: %v", err)
+						} else {
+							log.Printf("[Twilio] Loaded user_data into conversation: %+v", userData)
 						}
 					}
 				}
@@ -827,7 +829,7 @@ func normalizeAUNumber(input string) string {
 }
 
 // -----------------------------------------------------------------------------
-// TWILIO API + MOCK HELPERS
+// TWILIO API + MOCK / WEBHOOK HELPERS
 // -----------------------------------------------------------------------------
 
 func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
