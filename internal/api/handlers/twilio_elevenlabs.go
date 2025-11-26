@@ -159,7 +159,7 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 			// send webhook to Make with best phone identifier (raw_phone if present)
 			if conversation != nil && conversation.ConversationID != "" {
 				phone := conversation.CallerPhone
-				var email, firstName string
+				var email, firstName, businessName string
 
 				if conversation.UserData != nil {
 					if raw, ok := conversation.UserData["raw_phone"].(string); ok && raw != "" {
@@ -170,6 +170,9 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					}
 					if fn, ok := conversation.UserData["first_name"].(string); ok && fn != "" {
 						firstName = fn
+					}
+					if bn, ok := conversation.UserData["business_name"].(string); ok && bn != "" {
+						businessName = bn
 					}
 				}
 
@@ -185,6 +188,9 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 				}
 				if firstName != "" {
 					payload["first_name"] = firstName
+				}
+				if businessName != "" {
+					payload["business_name"] = businessName
 				}
 
 				_ = sendConversationWebhook(cfg, payload)
@@ -392,10 +398,11 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 		}
 
 		var req struct {
-			Number    string `json:"number"`
-			FirstName string `json:"first_name"`
-			Email     string `json:"email"`
-			Prompt    string `json:"prompt"` // optional, kept for compatibility
+			Number       string `json:"number"`
+			FirstName    string `json:"first_name"`
+			Email        string `json:"email"`
+			BusinessName string `json:"business_name"`
+			Prompt       string `json:"prompt"` // optional, kept for compatibility
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -452,12 +459,13 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 
 		// Build TwiML URL (normalized number for Twilio, raw_number for matching in webhook/HubSpot)
 		callURL := fmt.Sprintf(
-			"https://%s/outbound-call-twiml?number=%s&raw_number=%s&first_name=%s&email=%s&prompt=%s",
+			"https://%s/outbound-call-twiml?number=%s&raw_number=%s&first_name=%s&email=%s&business_name=%s&prompt=%s",
 			r.Host,
 			url.QueryEscape(normalizedNumber),
 			url.QueryEscape(req.Number), // raw Carrd value
 			url.QueryEscape(req.FirstName),
 			url.QueryEscape(req.Email),
+			url.QueryEscape(req.BusinessName),
 			url.QueryEscape(req.Prompt),
 		)
 
@@ -506,8 +514,9 @@ func HandleOutboundCallTwiml() http.Handler {
 		rawNumber := r.URL.Query().Get("raw_number") // raw from Carrd
 		firstName := r.URL.Query().Get("first_name")
 		email := r.URL.Query().Get("email")
+		businessName := r.URL.Query().Get("business_name")
 
-		// Build user_data JSON from query params (so ElevenLabs + webhook can see name/email/raw_phone)
+		// Build user_data JSON from query params (so ElevenLabs + webhook can see name/email/raw_phone/business_name)
 		userData := map[string]interface{}{}
 		if firstName != "" {
 			userData["first_name"] = firstName
@@ -517,6 +526,9 @@ func HandleOutboundCallTwiml() http.Handler {
 		}
 		if rawNumber != "" {
 			userData["raw_phone"] = rawNumber
+		}
+		if businessName != "" {
+			userData["business_name"] = businessName
 		}
 
 		userDataJSON, _ := json.Marshal(userData)
