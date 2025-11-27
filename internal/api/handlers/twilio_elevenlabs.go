@@ -266,8 +266,6 @@ func HandleMediaStream(upgrader websocket.Upgrader, cfg *config.Config) http.Han
 					if decoded, err := url.QueryUnescape(userStr); err == nil {
 						if err := json.Unmarshal([]byte(decoded), &userData); err != nil {
 							log.Printf("[Twilio] Error parsing user_data: %v", err)
-						} else {
-							log.Printf("[Twilio] Loaded user_data into conversation: %+v", userData)
 						}
 					}
 				}
@@ -440,7 +438,7 @@ func HandleOutboundCall(cfg *config.Config) http.Handler {
 		if dailyCallCount >= 50 { // global cap (tweak as needed)
 			dailyCallCountMu.Unlock()
 			log.Printf("[Guard] Daily call cap reached (%d). Blocking auto-call.", dailyCallCount)
-			http.Error(w, "Daily call limit reached. Your request has been recorded for manual review.", http.StatusTooManyRequests)
+			http.Error(w, "Daily call limit reached. Your request has been recorded for manual review.", http.StatusTooRequests)
 			return
 		}
 		dailyCallCountMu.Unlock()
@@ -829,7 +827,7 @@ func normalizeAUNumber(input string) string {
 }
 
 // -----------------------------------------------------------------------------
-// TWILIO API + MOCK / WEBHOOK HELPERS
+// TWILIO API + MOCK HELPERS
 // -----------------------------------------------------------------------------
 
 func createTwilioCall(params map[string]string, accountSid, authToken string) (map[string]interface{}, error) {
